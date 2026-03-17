@@ -1,0 +1,23 @@
+{
+  "$schema": "https://raw.githubusercontent.com/Ylianst/MeshCentral/master/meshcentral-config-schema.json",
+  "settings": {
+    "cert": "myserver.mydomain.com",
+    "port": 443,
+    "redirPort": 80,
+    "sessionKey": "MyReallySecretPassword1",
+    "mysql": {
+      "host": "127.0.0.1",
+      "port": 3306,
+      "user": "atomo",
+      "password": "atomo@1234",
+      "database": "meshcentral"
+    }
+  },
+  "domains": {
+    "": {
+      "title": "MyServer",
+      "NewAccounts": true,
+      "minify": false
+    }
+  }
+}
