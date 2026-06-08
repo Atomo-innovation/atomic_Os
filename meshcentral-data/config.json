@@ -1,32 +1,34 @@
 {
   "$schema": "https://raw.githubusercontent.com/Ylianst/MeshCentral/master/meshcentral-config-schema.json",
   "settings": {
-    "cert": "65.2.142.160",
+    "cert": "192.168.1.30",
     "port": 4434,
     "mpsPort": 4433,
     "redirPort": 1024,
-    "agentaliasdns": "65.2.142.160",
+    "agentaliasdns": "192.168.1.30",
     "autobackup": {
       "backuppath": "meshcentral-data/backups"
     },
     "sessionKey": "MyReallySecretPassword1",
     "disablePowerActions": true,
-    "mysql": {
-      "host": "127.0.0.1",
-      "port": 3306,
-      "user": "atomo",
-      "password": "atomo@1234",
-      "database": "meshcentral"
+    "no2factorauth": true,
+    "sqlite3": {
+      "name": "atomic-center",
+      "journalmode": "wal"
     }
   },
   "domains": {
     "": {
-      "title": "MyServer",
-      "NewAccounts": true,
+      "title": "Atomic Center",
+      "nodeLoginUrl": "http://192.168.1.30:3000",
+      "newaccounts": true,
       "minify": false,
       "sitestyle": 2,
       "forceclassicui": true,
-      "newaccountsrights": []
+      "newaccountsrights": [],
+      "passwordrequirements": {
+        "email2factor": false
+      }
     }
   }
 }

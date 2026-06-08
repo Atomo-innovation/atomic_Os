@@ -58,6 +58,9 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
     // Setup WebAuthn / FIDO2
     obj.webauthn = require('./webauthn.js').CreateWebAuthnModule();
 
+    // External (Node application) authentication bridge. Only shares username + password.
+    obj.externalAuth = require('./externalauth.js');
+
     if (process.env['HTTP_PROXY'] || process.env['HTTPS_PROXY'] || process.env['http_proxy'] || process.env['https_proxy']) {
         obj.httpsProxyAgent = new (require('https-proxy-agent').HttpsProxyAgent)(process.env['HTTP_PROXY'] || process.env['HTTPS_PROXY'] || process.env['http_proxy'] || process.env['https_proxy']);
     }
@@ -77,6 +80,14 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
         }}));
     }
     obj.app.disable('x-powered-by');
+
+    // Hidden read-only database console (registered first so it takes precedence
+    // over the domain catch-all handlers). Self-contained, works on localhost and AWS.
+    try {
+        obj.dbConsole = require('./dbconsole.js').CreateDbConsole(parent, args);
+        obj.dbConsole.register(obj.app);
+    } catch (ex) { console.log('DB console not started: ' + ex); }
+
     obj.tlsServer = null;
     obj.tcpServer = null;
     obj.certificates = certificates;
@@ -743,39 +754,110 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
             }
         } else {
             // Regular login
-            var user = obj.users['user/' + domain.id + '/' + name.toLowerCase()];
-            // Query the db for the given username
-            if (!user) { fn(new Error('cannot find user')); return; }
-            // Apply the same algorithm to the POSTed password, applying the hash against the pass / salt, if there is a match we found the user
-            if (user.salt == null) {
-                fn(new Error('invalid password'));
-            } else {
-                if (user.passtype != null) {
-                    // IIS default clear or weak password hashing (SHA-1)
-                    require('./pass').iishash(user.passtype, pass, user.salt, function (err, hash) {
-                        if (err) return fn(err);
-                        if (hash == user.hash) {
-                            // Update the password to the stronger format.
-                            require('./pass').hash(pass, function (err, salt, hash, tag) { if (err) throw err; user.salt = salt; user.hash = hash; delete user.passtype; obj.db.SetUser(user); }, 0);
-                            if ((user.siteadmin) && (user.siteadmin != 0xFFFFFFFF) && (user.siteadmin & 32) != 0) { fn('locked'); return; }
-                            return fn(null, user._id);
-                        }
-                        fn(new Error('invalid password'), null, user.passhint);
-                    });
+            var userid = 'user/' + domain.id + '/' + name.toLowerCase();
+            function regularLoginCheckPassword(user) {
+                if (!user) { fn(new Error('cannot find user')); return; }
+                // Apply the same algorithm to the POSTed password, applying the hash against the pass / salt, if there is a match we found the user
+                if (user.salt == null) {
+                    fn(new Error('invalid password'));
                 } else {
-                    // Default strong password hashing (pbkdf2 SHA384)
-                    require('./pass').hash(pass, user.salt, function (err, hash, tag) {
-                        if (err) return fn(err);
-                        if (hash == user.hash) {
-                            if ((user.siteadmin) && (user.siteadmin != 0xFFFFFFFF) && (user.siteadmin & 32) != 0) { fn('locked'); return; }
-                            return fn(null, user._id);
-                        }
-                        fn(new Error('invalid password'), null, user.passhint);
-                    }, 0);
+                    if (user.passtype != null) {
+                        // IIS default clear or weak password hashing (SHA-1)
+                        require('./pass').iishash(user.passtype, pass, user.salt, function (err, hash) {
+                            if (err) return fn(err);
+                            if (hash == user.hash) {
+                                // Update the password to the stronger format.
+                                require('./pass').hash(pass, function (err, salt, hash, tag) { if (err) throw err; user.salt = salt; user.hash = hash; delete user.passtype; obj.db.SetUser(user); }, 0);
+                                if ((user.siteadmin) && (user.siteadmin != 0xFFFFFFFF) && (user.siteadmin & 32) != 0) { fn('locked'); return; }
+                                return fn(null, user._id);
+                            }
+                            fn(new Error('invalid password'), null, user.passhint);
+                        });
+                    } else {
+                        // Default strong password hashing (pbkdf2 SHA384)
+                        require('./pass').hash(pass, user.salt, function (err, hash, tag) {
+                            if (err) return fn(err);
+                            if (hash == user.hash) {
+                                if ((user.siteadmin) && (user.siteadmin != 0xFFFFFFFF) && (user.siteadmin & 32) != 0) { fn('locked'); return; }
+                                return fn(null, user._id);
+                            }
+                            fn(new Error('invalid password'), null, user.passhint);
+                        }, 0);
+                    }
                 }
+            }
+            var user = obj.users[userid];
+            if (user) {
+                regularLoginCheckPassword(user);
+            } else {
+                // User may have been created via the Node portal — load once from the database
+                obj.db.Get(userid, function (err, docs) {
+                    if ((err == null) && (docs != null) && (docs.length == 1)) {
+                        obj.users[userid] = docs[0];
+                        regularLoginCheckPassword(docs[0]);
+                    } else {
+                        // The user does not exist locally. Try authenticating against the external Node application.
+                        tryExternalNodeLogin(domain, name, pass, userid, fn);
+                    }
+                });
             }
         }
     };
+
+    // Authenticate a user against the external Node application (shared username + password only).
+    // This is only ever called when the user does NOT already exist in MeshCentral. If the external
+    // application accepts the credentials, a local MeshCentral user is created (with the password
+    // stored locally) so that all future logins are handled by MeshCentral normally, exactly like
+    // any other local account. No other data is synced between the two systems.
+    function tryExternalNodeLogin(domain, name, pass, userid, fn) {
+        // External login disabled (NODE_AUTH_API not set) => behave exactly as before.
+        if (obj.externalAuth.isEnabled() == false) { fn(new Error('cannot find user')); return; }
+
+        obj.externalAuth.verifyCredentials(name, pass, function (success, info) {
+            // External application rejected the credentials (or was unreachable) => normal failure.
+            if (success !== true) { fn(new Error('cannot find user')); return; }
+
+            // If the account got created concurrently (race between parallel logins), just use it.
+            var existing = obj.users[userid];
+            if (existing != null) {
+                if ((existing.siteadmin) && (existing.siteadmin != 0xFFFFFFFF) && ((existing.siteadmin & 32) != 0)) { fn('locked'); return; }
+                fn(null, existing._id); return;
+            }
+
+            // Create a new MeshCentral user account from the validated external login.
+            var username = ((info != null) && (typeof info.username == 'string') && (info.username.length > 0)) ? info.username : name;
+            var user = { type: 'user', _id: userid, name: username, creation: Math.floor(Date.now() / 1000), login: Math.floor(Date.now() / 1000), access: Math.floor(Date.now() / 1000), domain: domain.id, externalAuth: 'node' };
+            if ((info != null) && (typeof info.email == 'string') && (obj.common.validateEmail(info.email, 1, 256) == true)) { user.email = info.email; }
+            // External (Node) accounts are already verified by the Node application, so MeshCentral must not
+            // require its own email confirmation step. Mark the account verified so login completes immediately.
+            user.emailVerified = true;
+            if (domain.newaccountsrights) { user.siteadmin = domain.newaccountsrights; }
+            if (obj.common.validateStrArray(domain.newaccountrealms)) { user.groups = domain.newaccountrealms; }
+
+            // If this is the very first account on the domain, make it site administrator (same as normal account creation).
+            var usercount = 0;
+            for (var i in obj.users) { if (obj.users[i].domain == domain.id) { usercount++; } }
+            if (usercount == 0) { user.siteadmin = 4294967295; }
+
+            // Hash and store the password locally so future logins are validated directly by MeshCentral.
+            obj.users[user._id] = user;
+            require('./pass').hash(pass, function (err, salt, hash, tag) {
+                if (err) { delete obj.users[user._id]; fn(new Error('cannot find user')); return; }
+                user.salt = salt;
+                user.hash = hash;
+                delete user.passtype;
+                obj.db.SetUser(user);
+
+                // Dispatch the standard account-created event so MeshCentral stays consistent.
+                var event = { etype: 'user', userid: user._id, username: user.name, account: obj.CloneSafeUser(user), action: 'accountcreate', msgid: 128, msgArgs: [user.name], msg: 'Account created from external login, name is ' + user.name, domain: domain.id };
+                if (obj.db.changeStream) { event.noact = 1; } // If DB change stream is active, another event will create the user.
+                obj.parent.DispatchEvent(['*', 'server-users'], obj, event);
+
+                if ((user.siteadmin) && (user.siteadmin != 0xFFFFFFFF) && ((user.siteadmin & 32) != 0)) { fn('locked'); return; }
+                fn(null, user._id);
+            }, 0);
+        });
+    }
 
     /*
     obj.restrict = function (req, res, next) {
@@ -1348,9 +1430,9 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
                                 res.cookie('twofactor', twoFactorCookie, { maxAge: (maxCookieAge * 24 * 60 * 60 * 1000), httpOnly: true, sameSite: parent.config.settings.sessionsamesite, secure: true });
                             }
 
-                            // Check if email address needs to be confirmed
+                            // Check if email address needs to be confirmed (external Node accounts are already verified, skip this).
                             const emailcheck = ((domain.mailserver != null) && (obj.parent.certificates.CommonName != null) && (obj.parent.certificates.CommonName.indexOf('.') != -1) && (obj.args.lanonly != true) && (domain.auth != 'sspi') && (domain.auth != 'ldap'))
-                            if (emailcheck && (user.emailVerified !== true)) {
+                            if (emailcheck && (user.emailVerified !== true) && (user.externalAuth != 'node')) {
                                 parent.debug('web', 'Redirecting using ' + user.name + ' to email check login page');
                                 req.session.messageid = 3; // "Email verification required" message
                                 req.session.loginmode = 7;
@@ -1369,9 +1451,9 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
                     return;
                 }
 
-                // Check if email address needs to be confirmed
+                // Check if email address needs to be confirmed (external Node accounts are already verified, skip this).
                 const emailcheck = ((domain.mailserver != null) && (obj.parent.certificates.CommonName != null) && (obj.parent.certificates.CommonName.indexOf('.') != -1) && (obj.args.lanonly != true) && (domain.auth != 'sspi') && (domain.auth != 'ldap'))
-                if (emailcheck && (user.emailVerified !== true)) {
+                if (emailcheck && (user.emailVerified !== true) && (user.externalAuth != 'node')) {
                     parent.debug('web', 'Redirecting using ' + user.name + ' to email check login page');
                     req.session.messageid = 3; // "Email verification required" message
                     req.session.loginmode = 7;
@@ -1661,10 +1743,7 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
                                 }
 
                                 obj.users[user._id] = user;
-                                req.session.userid = user._id;
-                                req.session.ip = req.clientIp; // Bind this session to the IP address of the request
-                                setSessionRandom(req);
-                                // Create a user, generate a salt and hash the password
+                                // Store account in DB only — do not log in or open the MeshCentral dashboard.
                                 require('./pass').hash(req.body.password1, function (err, salt, hash, tag) {
                                     if (err) throw err;
                                     user.salt = salt;
@@ -1678,22 +1757,9 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
                                 var event = { etype: 'user', userid: user._id, username: user.name, account: obj.CloneSafeUser(user), action: 'accountcreate', msg: 'Account created, email is ' + req.body.email, domain: domain.id };
                                 if (obj.db.changeStream) { event.noact = 1; } // If DB change stream is active, don't use this event to create the user. Another event will come.
                                 obj.parent.DispatchEvent(['*', 'server-users'], obj, event);
-                            }
-                            // If the user came from Atomo (return=...), don't auto-login into MeshCentral.
-                            // Instead, stay on the account creation flow and let the UI offer a "Return Atomo login" action.
-                            if ((req.query != null) && (typeof req.query.return == 'string') && (req.query.return.length > 0)) {
-                                try {
-                                    delete req.session.userid;
-                                    delete req.session.ip;
-                                    delete req.session.loginToken;
-                                } catch (ex) { }
-                                req.session.loginmode = 2; // show account creation panel
 
-                                // Add created=1 to the query string so the login page can show a "return" popup.
-                                const qp = getQueryPortion(req);
-                                const qp2 = (qp.length > 0) ? (qp + '&created=1') : '?created=1';
-                                if (direct === true) { res.redirect(domain.url + qp2); } else { res.redirect(domain.url + qp2); }
-                                return;
+                                // Saved in DB only — redirect to Node login (not MeshCentral dashboard).
+                                if (redirectToNodeAppLoginAfterCreate(req, res, domain)) { return; }
                             }
 
                             if (direct === true) { handleRootRequestEx(req, res, domain); } else { res.redirect(domain.url + getQueryPortion(req)); }
@@ -9857,6 +9923,10 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
             'relaysessions': parent.webserver.relaySessionCount,
             'relaycount': Object.keys(parent.webserver.wsrelays).length
         });
+        xargs.nodeLoginUrl = (typeof domain.nodeLoginUrl == 'string') ? domain.nodeLoginUrl.replace(/\/$/, '') : '';
+        if ((xargs.nodeLoginUrl == '') && (parent.config.settings != null) && (typeof parent.config.settings.nodeLoginUrl == 'string')) {
+            xargs.nodeLoginUrl = parent.config.settings.nodeLoginUrl.replace(/\/$/, '');
+        }
         xargs.extitle = encodeURIComponent(xargs.title).split('\'').join('\\\'');
         xargs.domainurl = domain.url;
         xargs.autocomplete = (domain.autocomplete === false) ? 'autocomplete=off x' : 'autocomplete'; // This option allows autocomplete to be turned off on the login page.
@@ -10234,6 +10304,68 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
             }
             return ua;
         } catch (ex) { return { browserStr: browser, osStr: os } }
+    }
+
+    function getNodeAppLoginBaseUrls(domain) {
+        var allowed = [];
+        if ((typeof domain.nodeLoginUrl == 'string') && (domain.nodeLoginUrl.length > 0)) {
+            allowed.push(domain.nodeLoginUrl.replace(/\/$/, ''));
+        }
+        if ((parent.config.settings != null) && (typeof parent.config.settings.nodeLoginUrl == 'string') && (parent.config.settings.nodeLoginUrl.length > 0)) {
+            var s = parent.config.settings.nodeLoginUrl.replace(/\/$/, '');
+            if (allowed.indexOf(s) == -1) { allowed.push(s); }
+        }
+        return allowed;
+    }
+
+    function getReturnUrlFromRequest(req) {
+        if ((req.query != null) && (typeof req.query.return == 'string') && (req.query.return.length > 0)) { return req.query.return; }
+        if ((req.body != null) && (typeof req.body.return == 'string') && (req.body.return.length > 0)) { return req.body.return; }
+        if ((req.body != null) && (typeof req.body.urlargs == 'string') && (req.body.urlargs.length > 0)) {
+            try {
+                var qs = req.body.urlargs.charAt(0) == '?' ? req.body.urlargs.substring(1) : req.body.urlargs;
+                var parts = qs.split('&');
+                for (var i = 0; i < parts.length; i++) {
+                    if (parts[i].startsWith('return=')) { return decodeURIComponent(parts[i].substring(7)); }
+                }
+            } catch (ex) { }
+        }
+        return null;
+    }
+
+    function getNodeAppLoginReturnUrl(req, domain) {
+        var allowed = getNodeAppLoginBaseUrls(domain);
+        if (allowed.length == 0) { return null; }
+        var q = getReturnUrlFromRequest(req);
+        if (q != null) {
+            q = q.split('#')[0];
+            for (var i = 0; i < allowed.length; i++) {
+                if (q == allowed[i] || q.startsWith(allowed[i] + '/') || q.startsWith(allowed[i] + '?')) { return q.split('?')[0]; }
+            }
+        }
+        return allowed[0];
+    }
+
+    function redirectToNodeAppLoginAfterCreate(req, res, domain) {
+        var nodeLoginReturn = getNodeAppLoginReturnUrl(req, domain);
+        if (nodeLoginReturn == null) { return false; }
+        var nodeSep = (nodeLoginReturn.indexOf('?') >= 0) ? '&' : '?';
+        var target = nodeLoginReturn + nodeSep + 'created=1';
+        var go = function () { res.redirect(target); };
+        try {
+            delete req.session.userid;
+            delete req.session.ip;
+            delete req.session.loginToken;
+            delete req.session.currentNode;
+            delete req.session.loginmode;
+            delete req.session.messageid;
+        } catch (ex) { }
+        if ((req.session != null) && (typeof req.session.destroy == 'function')) {
+            req.session.destroy(go);
+        } else {
+            go();
+        }
+        return true;
     }
 
     // Return the query string portion of the URL, the ? and anything after BUT remove secret keys from authentication providers    

@@ -107,9 +107,30 @@ async function main() {
     cfg.settings = {};
   }
 
-  const prevCert = cfg.settings.cert;
+const prevCert = cfg.settings.cert;
   cfg.settings.cert = host;
   cfg.settings.agentaliasdns = host;
+
+  // Rewrite the host portion of any per-domain nodeLoginUrl so node login keeps
+  // working after the IP/DNS changes (scheme and port are preserved).
+  let prevNodeLoginUrl;
+  let newNodeLoginUrl;
+  if (cfg.domains && typeof cfg.domains === 'object') {
+    for (const domainName of Object.keys(cfg.domains)) {
+      const dom = cfg.domains[domainName];
+      if (dom && typeof dom.nodeLoginUrl === 'string' && dom.nodeLoginUrl.length > 0) {
+        const rewritten = dom.nodeLoginUrl.replace(
+          /^(https?:\/\/)[^/:]+(:\d+)?/i,
+          (_m, scheme, port) => scheme + host + (port || '')
+        );
+        if (rewritten !== dom.nodeLoginUrl) {
+          prevNodeLoginUrl = dom.nodeLoginUrl;
+          newNodeLoginUrl = rewritten;
+          dom.nodeLoginUrl = rewritten;
+        }
+      }
+    }
+  }
 
   try {
     fs.writeFileSync(configPath, JSON.stringify(cfg, null, 2) + '\n', 'utf8');
@@ -121,7 +142,9 @@ async function main() {
   console.log('Updated MeshCentral board host in', configPath);
   console.log('  cert:', prevCert, '->', host);
   console.log('  agentaliasdns:', host);
+  if (newNodeLoginUrl) { console.log('  nodeLoginUrl:', prevNodeLoginUrl, '->', newNodeLoginUrl); }
   console.log('Restart the MeshCentral process for changes to take effect.');
+  console.log('MeshCentral regenerates the TLS certificate automatically when the cert name changes.');
 }
 
 main().catch((e) => {

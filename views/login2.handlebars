@@ -98,6 +98,9 @@
                             <div id="newAccountDiv" style="display:none;padding:2px;padding-top:10px">
                                 Don&#39;t have an account? <a onclick="return xgo(2,event);" href="#" style=cursor:pointer>Create one</a>.
                             </div>
+                            <div id="backToAtomoLoginDiv" style="display:none;padding:2px;padding-top:10px">
+                                <a id="backToAtomoLoginLink" href="#" style="cursor:pointer">Back to Atomo login</a>
+                            </div>
                         </div>
                         <input id=loginformargs name="urlargs" type="hidden" value="" />
                         <div id="authStrategies" style="display:none">
@@ -164,7 +167,7 @@
                                 </td>
                             </tr>
                         </table>
-                        <hr /><a onclick="return xgo(1,event);" href="#" style=cursor:pointer>Back to login</a><span id="backToAtomoSpan" style="display:none"> | <a id="backToAtomoLink" href="#" style="cursor:pointer">Back to Atomo</a></span>
+                        <hr /><a onclick="return xgo(1,event);" href="#" style=cursor:pointer>Back to login</a><span id="backToAtomoSpan" style="display:none"> | <a id="backToAtomoLink" href="#" style="cursor:pointer">Back to Atomo login</a></span>
                         <input id=createformargs name="urlargs" type="hidden" value="" />
                         <input id=createformcaptcha name="captchaargs" type="hidden" value="{{{newAccountCaptcha}}}" />
                     </form>
@@ -430,7 +433,7 @@
             // Display the right server message
             var i;
             var messageid = parseInt('{{{messageid}}}');
-            var okmessages = ['', "If valid, reset mail sent.", "Email sent.", "Email verification required, check your mailbox and click the confirmation link.", "SMS sent.", "Sending notification...", "Message sent."];
+            var okmessages = ['', "If valid, reset mail sent.", "Email sent.", "Email verification required, check your mailbox and click the confirmation link.", "SMS sent.", "Sending notification...", "Message sent.", "Account created successfully. Your details are saved — log in when you are ready."];
             var failmessages = ["Unable to create account.", "Account limit reached.", "Existing account with this email address.", "Invalid account creation token.", "Username already exists.", "Password rejected, use a different one.", "Invalid email.", "Account not found.", "Invalid token, try again.", "Unable to sent email.", "Account locked.", "Access denied.", "Login failed, check username and password.", "Password change requested.", "IP address blocked, try again later.", "Server under maintenance.", "Unable to send device notification.", "Invalid security check."];
             if (messageid > 0) {
                 var msg = '';
@@ -458,18 +461,16 @@
             // Fix links if a loginKey if used
             var urlargs = parseUriArgs(true);
             //if (urlargs.key) { Q('termsLinkFooter').href += '?key=' + urlargs.key; }
+            var nodeLoginUrl = '{{{nodeLoginUrl}}}';
+            var atomoLoginTarget = nodeLoginUrl;
             if ((typeof urlargs.return == 'string') && (urlargs.return.length > 0)) {
                 var r = urlargs.return;
-                if ((r.startsWith('http://') || r.startsWith('https://') || r.startsWith('/')) && (Q('backToAtomoLink') != null)) {
-                    Q('backToAtomoLink').href = r;
-                    QV('backToAtomoSpan', true);
-                }
+                if (r.startsWith('http://') || r.startsWith('https://')) { atomoLoginTarget = r.split('?')[0].replace(/\/$/, '') || r; }
             }
-            if ((urlargs != null) && ((urlargs.created == 1) || (urlargs.created == '1')) && (Q('backToAtomoLink') != null) && (QS('backToAtomoSpan').display != 'none')) {
-                Q('idx_dlgOkButton').value = "Return Atomo login";
-                setDialogMode(1, "Account created", 1, function () { window.location.href = Q('backToAtomoLink').href; }, "Account created successfully.");
+            if (atomoLoginTarget) {
+                if (Q('backToAtomoLink') != null) { Q('backToAtomoLink').href = atomoLoginTarget; QV('backToAtomoSpan', true); }
+                if (Q('backToAtomoLoginLink') != null) { Q('backToAtomoLoginLink').href = atomoLoginTarget; QV('backToAtomoLoginDiv', true); }
             }
-
             // Show Language Select Box if needed
             if (showLanguageSelect === 'top' || showLanguageSelect === 'bottom') {
                 var x = '<select id=d2langselect style="box-sizing:border-box;width:280px;border:0;border-radius:4px;padding:8px" onChange="changeLanguage()">';

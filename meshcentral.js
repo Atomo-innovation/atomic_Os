@@ -96,7 +96,7 @@ function CreateMeshCentralServer(config, args) {
         if (obj.fs.existsSync(obj.path.join(__dirname, '../../meshcentral-web/emails'))) { obj.webEmailsOverridePath = obj.path.join(__dirname, '../../meshcentral-web/emails'); }
     } else {
         obj.parentpath = __dirname;
-        // Prefer meshcentral-data inside project when it has config (so MySQL config is used)
+        // Prefer meshcentral-data inside project when it has config
         var innerData = obj.path.join(__dirname, 'meshcentral-data');
         obj.datapath = (obj.fs.existsSync(innerData) && obj.fs.existsSync(obj.path.join(innerData, 'config.json'))) ? innerData : obj.path.join(__dirname, '../meshcentral-data');
         obj.filespath = obj.path.join(__dirname, '../meshcentral-files');
@@ -184,25 +184,6 @@ function CreateMeshCentralServer(config, args) {
         if (obj.args.mysql == true) { console.log('Must specify: --mysql [connectionstring] \r\nExample mysql://user:password@127.0.0.1:3306/database'); return; }
         if (obj.args.mariadb == true) { console.log('Must specify: --mariadb [connectionstring] \r\nExample mariadb://user:password@127.0.0.1:3306/database'); return; }
         for (i in obj.config.settings) { obj.args[i] = obj.config.settings[i]; } // Place all settings into arguments, arguments have already been placed into settings so arguments take precedence.
-
-        // Default MySQL connection (user: atomo, password: atomo@1234) when mysql is not set in config
-        if (obj.args.mysql == null && obj.args.mariadb == null) {
-            obj.args.mysql = {
-                host: '127.0.0.1',
-                port: 3306,
-                user: 'atomo',
-                password: 'atomo@1234',
-                database: 'meshcentral'
-            };
-            if (obj.config.settings == null) { obj.config.settings = {}; }
-            obj.config.settings.mysql = obj.args.mysql; // so mysql2 driver is included in npm install
-        } else if (typeof obj.args.mysql === 'object' && obj.args.mysql != null) {
-            if (obj.args.mysql.user == null) { obj.args.mysql.user = 'atomo'; }
-            if (obj.args.mysql.password == null) { obj.args.mysql.password = 'atomo@1234'; }
-            if (obj.args.mysql.host == null) { obj.args.mysql.host = '127.0.0.1'; }
-            if (obj.args.mysql.port == null) { obj.args.mysql.port = 3306; }
-            if (obj.args.mysql.database == null) { obj.args.mysql.database = 'meshcentral'; }
-        }
 
         if ((obj.args.help == true) || (obj.args['?'] == true)) {
             console.log('MeshCentral v' + getCurrentVersion() + ', remote computer management web portal.');
@@ -4127,7 +4108,7 @@ function getConfig(createSampleConfig) {
     if ((__dirname.endsWith('/node_modules/meshcentral')) || (__dirname.endsWith('\\node_modules\\meshcentral')) || (__dirname.endsWith('/node_modules/meshcentral/')) || (__dirname.endsWith('\\node_modules\\meshcentral\\'))) {
         datapath = path.join(__dirname, '../../meshcentral-data');
     } else {
-        // When running from project root, prefer meshcentral-data inside project (so MySQL config is used)
+        // When running from project root, prefer meshcentral-data inside project
         var innerData = path.join(__dirname, 'meshcentral-data');
         datapath = (fs.existsSync(innerData) && fs.existsSync(path.join(innerData, 'config.json'))) ? innerData : path.join(__dirname, '../meshcentral-data');
     }

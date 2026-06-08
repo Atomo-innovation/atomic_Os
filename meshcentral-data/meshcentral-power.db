@@ -1,6 +1,8 @@
+{"time":{"$$date":1780553568310},"nodeid":"*","power":0,"s":1,"_id":"524tluV4kgnQ7NA2"}
+{"time":{"$$date":1780553538995},"nodeid":"*","power":0,"s":1,"_id":"F3elJAFLcvrJjgHz"}
+{"time":{"$$date":1780553517398},"nodeid":"*","power":0,"s":1,"_id":"JU9ulqR4Cbbfi0In"}
+{"time":{"$$date":1780553536020},"nodeid":"*","power":0,"s":1,"_id":"oX0cLXPJA2ks9VqY"}
+{"time":{"$$date":1780553437695},"nodeid":"*","power":0,"s":1,"_id":"qjSZMrS0Wg1n7sby"}
+{"time":{"$$date":1780553571253},"nodeid":"*","power":0,"s":1,"_id":"wHUuq4AtnFVYGDtc"}
 {"$$indexCreated":{"fieldName":"nodeid","unique":false,"sparse":false}}
 {"$$indexCreated":{"fieldName":"time","unique":false,"sparse":false}}
-{"$$indexCreated":{"fieldName":"nodeid"}}
-{"$$indexCreated":{"fieldName":"time","expireAfterSeconds":864000}}
-{"time":{"$$date":1775039946965},"nodeid":"*","power":0,"s":1,"_id":"eXWZ4pPDIO9wJVLB"}
-{"time":{"$$date":1775040109813},"nodeid":"node//VgvFj9BQGVpj@vf91S4XMKi5piBmnSxZd9J@XkcEAz35HZnZzNij6fxEB209e@Wu","power":1,"_id":"4JC8ZRgVeOW383Xy"}

@@ -149,7 +149,7 @@
                                                 </td>
                                             </tr>
                                         </table>
-                                        <hr /><a onclick=xgo(1) style=cursor:pointer>Back to login</a><span id="backToAtomoSpan" style="display:none"> | <a id="backToAtomoLink" href="#" style="cursor:pointer">Back to Atomo</a></span>
+                                        <hr /><a onclick=xgo(1) style=cursor:pointer>Back to login</a>
                                         <input id=createformargs name="urlargs" type="hidden" value="" />
                                         <input id=createformcaptcha name="captchaargs" type="hidden" value="{{{newAccountCaptcha}}}" />
                                     </form>
@@ -434,17 +434,6 @@
             validateCreate();
             var urlargs = parseUriArgs(true);
             var wantCreateAccount = (urlargs && ((urlargs.createaccount == 1) || (urlargs.createaccount == '1') || (urlargs.create == 1) || (urlargs.create == '1')));
-            if ((typeof urlargs.return == 'string') && (urlargs.return.length > 0)) {
-                var r = urlargs.return;
-                if ((r.startsWith('http://') || r.startsWith('https://') || r.startsWith('/')) && (Q('backToAtomoLink') != null)) {
-                    Q('backToAtomoLink').href = r;
-                    QV('backToAtomoSpan', true);
-                }
-            }
-            if ((urlargs != null) && ((urlargs.created == 1) || (urlargs.created == '1')) && (Q('backToAtomoLink') != null) && (QS('backToAtomoSpan').display != 'none')) {
-                Q('idx_dlgOkButton').value = "Return Atomo login";
-                setDialogMode(1, "Account created", 1, function () { window.location.href = Q('backToAtomoLink').href; }, "Account created successfully.");
-            }
             if (wantCreateAccount && ((newAccount === '1') || (newAccount === 'true'))) { go(2); }
             else if (loginMode.length != 0) { go(parseInt(loginMode)); }
             else { go(1); }

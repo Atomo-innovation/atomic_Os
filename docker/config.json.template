@@ -33,11 +33,11 @@
       "database": ""
     },
     "_mysql": {
-      "host": "127.0.0.1",
+      "host": "",
       "port": 3306,
-      "user": "atomo",
-      "password": "atomo@1234",
-      "database": "meshcentral"
+      "user": "",
+      "password": "",
+      "database": ""
     }
   },
   "domains": {

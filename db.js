@@ -867,14 +867,6 @@ module.exports.CreateDB = function (parent, func) {
         });
     } else if (parent.args.mariadb || parent.args.mysql) {
         var connectinArgs = (parent.args.mariadb) ? parent.args.mariadb : parent.args.mysql;
-        // Default MySQL credentials in code (atomo / atomo@1234) when using object config with missing fields
-        if (typeof connectinArgs === 'object' && connectinArgs != null) {
-            if (connectinArgs.user == null) { connectinArgs.user = 'atomo'; }
-            if (connectinArgs.password == null) { connectinArgs.password = 'atomo@1234'; }
-            if (connectinArgs.host == null) { connectinArgs.host = '127.0.0.1'; }
-            if (connectinArgs.port == null) { connectinArgs.port = 3306; }
-            if (connectinArgs.database == null) { connectinArgs.database = 'meshcentral'; }
-        }
         if (typeof connectinArgs == 'string') {
             const parts = connectinArgs.split(/[:@/]+/);
             var connectionObject = {
