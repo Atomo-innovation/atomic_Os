@@ -265,6 +265,35 @@
                                 <input id=resetpasswordformargs name="urlargs" type="hidden" value="" />
                             </form>
                         </div>
+                        <div id=createotppanel style="display:none;position:relative">
+                            <form id=createotppanelform method=post>
+                                <input type=hidden name=action value=verifycreateotp />
+                                <div id=message9></div>
+                                <div>
+                                    <b>Email Verification</b>
+                                </div>
+                                <p id=regotpEmailHint style="margin-top:8px;margin-bottom:8px"></p>
+                                <table>
+                                    <tr>
+                                        <td align=right width=100>Code:</td>
+                                        <td><input id=regotpInput {{{autocomplete}}}="one-time-code" inputmode="numeric" pattern="[0-9]*" type=text maxlength=8 name=regotp oninput=validateRegOtp(event) onpaste=validateRegOtp(event) onkeydown=validateRegOtp(event) /></td>
+                                    </tr>
+                                    <tr>
+                                        <td colspan=2>
+                                            <div style=float:right><input id=regotpVerifyButton type=button onclick="submitRegOtpForm()" value="Verify" disabled="disabled" /></div>
+                                        </td>
+                                    </tr>
+                                    <tr>
+                                        <td colspan=2>
+                                            <input id=regotpResendButton type=button value="Resend OTP" onclick="resendRegOtp()" disabled="disabled" />
+                                            <span id=regotpResendTimer style="margin-left:8px"></span>
+                                        </td>
+                                    </tr>
+                                </table>
+                                <hr /><a onclick="return xgo(1,event);" href="#" style=cursor:pointer>Back to login</a>
+                                <input id=createotpformargs name="urlargs" type="hidden" value="" />
+                            </form>
+                        </div>
                         <div id=checkemailpanel style="display:none;position:relative">
                             <form method=post>
                                 <input type=hidden name=action value=checkemail />
@@ -340,6 +369,8 @@
         var features = parseInt('{{{features}}}');
         var welcomeText = decodeURIComponent('{{{welcometext}}}');
         var currentpanel = 0;
+        var regotpResendSeconds = parseInt('{{{regotpResendSeconds}}}') || 0;
+        var regotpCountdownTimer = null;
         var uiMode = parseInt(getstore('uiMode', '1'));
         var webPageFullScreen = true;
         var nightMode = (getstore('_nightMode', '0') == '1');
@@ -357,15 +388,15 @@
             // Display the right server message
             var i;
             var messageid = parseInt('{{{messageid}}}');
-            var okmessages = ['', "If valid, reset mail sent.", "Email sent.", "Email verification required, check your mailbox and click the confirmation link.", "SMS sent.", "Sending notification...", "Message sent.", "Account created successfully. Your details are saved — log in when you are ready."];
-            var failmessages = ["Unable to create account.", "Account limit reached.", "Existing account with this email address.", "Invalid account creation token.", "Username already exists.", "Password rejected, use a different one.", "Invalid email.", "Account not found.", "Invalid token, try again.", "Unable to sent email.", "Account locked.", "Access denied.", "Login failed, check username and password.", "Password change requested.", "IP address blocked, try again later.", "Server under maintenance.", "Unable to send device notification.", "Invalid security check."];
+            var okmessages = ['', "If valid, reset mail sent.", "Email sent.", "Email verification required, check your mailbox and click the confirmation link.", "SMS sent.", "Sending notification...", "Message sent.", "Account created successfully. Your details are saved — log in when you are ready.", "Verification code sent to your email. Enter the 8-digit code below."];
+            var failmessages = ["Unable to create account.", "Account limit reached.", "Existing account with this email address.", "Invalid account creation token.", "Username already exists.", "Password rejected, use a different one.", "Invalid email.", "Account not found.", "Invalid token, try again.", "Unable to sent email.", "Account locked.", "Access denied.", "Login failed, check username and password.", "Password change requested.", "IP address blocked, try again later.", "Server under maintenance.", "Unable to send device notification.", "Invalid security check.", "Invalid verification code.", "Verification code expired. Please start account creation again.", "Too many failed attempts. Please start account creation again.", "Please wait before requesting another code.", "Unable to send verification email."];
             if (messageid > 0) {
                 var msg = '';
                 if ((messageid < 100) && (messageid < okmessages.length)) { msg = okmessages[messageid]; }
                 else if ((messageid >= 100) && ((messageid - 100) < failmessages.length)) { msg = failmessages[messageid - 100]; }
                 if (msg != '') {
                     if (messageid >= 100) { msg = ('<span class="msg error"><b style=color:#8C001A>' + msg + '<b></span><br /><br />'); } else { msg = ('<span class="msg success"><b>' + msg + '</b></span><br /><br />'); }
-                    for (i = 1; i < 8; i++) { QH('message' + i, msg); }
+                    for (i = 1; i < 10; i++) { QH('message' + i, msg); }
                 }
             }
 
@@ -422,6 +453,7 @@
                 Q('resettokenformargs').value = xurlargs;
                 Q('resetpasswordformargs').value = xurlargs;
                 Q('checkemailformargs').value = xurlargs;
+                Q('createotpformargs').value = xurlargs;
             }
 
             //var webPageFullScreen = getstore('webPageFullScreen', true);
@@ -672,6 +704,7 @@
             QV('message5', false);
             QV('message6', false);
             QV('message7', false);
+            QV('message9', false);
             go(x);
             haltEvent(e);
             return false;
@@ -688,6 +721,7 @@
             QV('resettokenpanel', x == 5);
             QV('resetpasswordpanel', x == 6);
             QV('checkemailpanel', x == 7);
+            QV('createotppanel', x == 9);
             if (x == 1) { Q('username').focus(); }
             if (x == 2) { if (features & 0x200000) { Q('aemail').focus(); } else { Q('ausername').focus(); } } // Email is username
             if (x == 3) { Q('remail').focus(); }
@@ -699,6 +733,77 @@
                 QV('checkCheckOperations', Q('unconfirmedEmail').innerHTML != '');
                 QH('checkEmailVal', passhint);
             }
+            if (x == 9) {
+                QH('regotpEmailHint', passhint ? ('A verification code was sent to <b>' + passhint + '</b>.') : 'A verification code was sent to your email.');
+                Q('regotpInput').value = '';
+                QE('regotpVerifyButton', false);
+                startRegOtpCountdown(regotpResendSeconds);
+                setTimeout(function () { Q('regotpInput').focus(); }, 100);
+            } else {
+                stopRegOtpCountdown();
+            }
+        }
+
+        function validateRegOtp(e) {
+            var v = Q('regotpInput').value.replace(/\D/g, '').substring(0, 8);
+            if (Q('regotpInput').value != v) { Q('regotpInput').value = v; }
+            var ok = (v.length == 8);
+            QE('regotpVerifyButton', ok);
+            if ((e != null) && (e.type == 'keydown') && (e.keyCode == 13) && ok) {
+                haltEvent(e);
+                submitRegOtpForm();
+            }
+        }
+
+        function submitRegOtpForm() {
+            Q('createotppanelform').submit();
+        }
+
+        function stopRegOtpCountdown() {
+            if (regotpCountdownTimer != null) { clearInterval(regotpCountdownTimer); regotpCountdownTimer = null; }
+        }
+
+        function startRegOtpCountdown(seconds) {
+            stopRegOtpCountdown();
+            regotpResendSeconds = seconds;
+            updateRegOtpResendUi();
+            if (regotpResendSeconds > 0) {
+                regotpCountdownTimer = setInterval(function () {
+                    regotpResendSeconds--;
+                    updateRegOtpResendUi();
+                    if (regotpResendSeconds <= 0) { stopRegOtpCountdown(); }
+                }, 1000);
+            }
+        }
+
+        function updateRegOtpResendUi() {
+            if (regotpResendSeconds > 0) {
+                QE('regotpResendButton', false);
+                QH('regotpResendTimer', 'Resend available in ' + regotpResendSeconds + 's');
+            } else {
+                QE('regotpResendButton', true);
+                QH('regotpResendTimer', '');
+            }
+        }
+
+        function resendRegOtp() {
+            if (regotpResendSeconds > 0) { return false; }
+            var f = document.createElement('form');
+            f.method = 'post';
+            f.style.display = 'none';
+            var a = document.createElement('input');
+            a.type = 'hidden';
+            a.name = 'action';
+            a.value = 'resendcreateotp';
+            f.appendChild(a);
+            var u = document.createElement('input');
+            u.type = 'hidden';
+            u.name = 'urlargs';
+            u.value = Q('createotpformargs').value;
+            f.appendChild(u);
+            document.body.appendChild(f);
+            f.submit();
+            return false;
         }
 
         function validateLogin(box, e) {

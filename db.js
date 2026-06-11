@@ -813,6 +813,8 @@ module.exports.CreateDB = function (parent, func) {
                         CREATE TABLE power (id INTEGER PRIMARY KEY, time TIMESTAMP, nodeid CHAR(255), doc JSON);
                         CREATE TABLE smbios (id CHAR(255) PRIMARY KEY, time TIMESTAMP, expire TIMESTAMP, doc JSON);
                         CREATE TABLE plugin (id INTEGER PRIMARY KEY, doc JSON);
+                        CREATE TABLE registration_otp (id VARCHAR(64) PRIMARY KEY NOT NULL, email VARCHAR(256) NOT NULL, otpHash VARCHAR(512) NOT NULL, createdAt INTEGER NOT NULL, expiresAt INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, verified INTEGER NOT NULL DEFAULT 0, lastSentAt INTEGER, domain VARCHAR(64), pendingData TEXT);
+                        CREATE INDEX ndxregistrationotpemail ON registration_otp (email, domain);
                         CREATE INDEX ndxtypedomainextra ON main (type, domain, extra);
                         CREATE INDEX ndxextra ON main (extra);
                         CREATE INDEX ndxextraex ON main (extraex);
@@ -3233,6 +3235,65 @@ module.exports.CreateDB = function (parent, func) {
                 }
                 func(r);
             });
+        }
+
+        // Registration OTP storage
+        if (obj.databaseType == DB_SQLITE) {
+            obj.file.exec('CREATE TABLE IF NOT EXISTS registration_otp (id VARCHAR(64) PRIMARY KEY NOT NULL, email VARCHAR(256) NOT NULL, otpHash VARCHAR(512) NOT NULL, createdAt INTEGER NOT NULL, expiresAt INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, verified INTEGER NOT NULL DEFAULT 0, lastSentAt INTEGER, domain VARCHAR(64), pendingData TEXT); CREATE INDEX IF NOT EXISTS ndxregistrationotpemail ON registration_otp (email, domain);');
+            obj.SetRegistrationOtp = function (record, func) {
+                sqlDbQuery('INSERT INTO registration_otp (id, email, otpHash, createdAt, expiresAt, attempts, verified, lastSentAt, domain, pendingData) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) ON CONFLICT (id) DO UPDATE SET otpHash = $3, createdAt = $4, expiresAt = $5, attempts = $6, verified = $7, lastSentAt = $8, pendingData = $10', [record.id, record.email, record.otpHash, record.createdAt, record.expiresAt, (record.attempts || 0), (record.verified ? 1 : 0), (record.lastSentAt || null), record.domain, record.pendingData], func);
+            };
+            obj.GetRegistrationOtpById = function (id, func) {
+                sqlDbQuery('SELECT id, email, otpHash, createdAt, expiresAt, attempts, verified, lastSentAt, domain, pendingData FROM registration_otp WHERE id = $1', [id], function (err, docs) {
+                    if (err || docs == null || docs.length == 0) { func(err, null); return; }
+                    var r = docs[0];
+                    r.verified = (r.verified === 1);
+                    func(null, r);
+                });
+            };
+            obj.RemoveRegistrationOtp = function (id, func) {
+                sqlDbQuery('DELETE FROM registration_otp WHERE id = $1', [id], func);
+            };
+            obj.RemoveRegistrationOtpByEmail = function (email, domain, func) {
+                sqlDbQuery('DELETE FROM registration_otp WHERE email = $1 AND domain = $2', [email, domain], func);
+            };
+            obj.DeleteExpiredRegistrationOtps = function (func) {
+                sqlDbQuery('DELETE FROM registration_otp WHERE expiresAt < $1', [Date.now()], func);
+            };
+        } else {
+            obj.SetRegistrationOtp = function (record, func) {
+                var doc = { _id: 'regotp/' + record.domain + '/' + record.email, type: 'regotp', id: record.id, email: record.email, otpHash: record.otpHash, createdAt: record.createdAt, expiresAt: record.expiresAt, attempts: record.attempts || 0, verified: record.verified === true, lastSentAt: record.lastSentAt, domain: record.domain, pendingData: record.pendingData };
+                obj.Set(doc, func);
+            };
+            obj.GetRegistrationOtpById = function (id, func) {
+                obj.GetAllType('regotp', function (err, docs) {
+                    if (err || docs == null) { func(err, null); return; }
+                    for (var i = 0; i < docs.length; i++) { if (docs[i].id === id) { func(null, docs[i]); return; } }
+                    func(null, null);
+                });
+            };
+            obj.RemoveRegistrationOtp = function (id, func) {
+                obj.GetAllType('regotp', function (err, docs) {
+                    if (docs != null) { for (var i = 0; i < docs.length; i++) { if (docs[i].id === id) { obj.Remove(docs[i]._id, func); return; } } }
+                    if (func) { func(); }
+                });
+            };
+            obj.RemoveRegistrationOtpByEmail = function (email, domain, func) {
+                obj.Remove('regotp/' + domain + '/' + email, func);
+            };
+            obj.DeleteExpiredRegistrationOtps = function (func) {
+                obj.GetAllType('regotp', function (err, docs) {
+                    if (docs == null) { if (func) { func(); } return; }
+                    var now = Date.now(), pending = 0;
+                    for (var i = 0; i < docs.length; i++) {
+                        if (docs[i].expiresAt < now) {
+                            pending++;
+                            obj.Remove(docs[i]._id, function () { if (--pending == 0 && func) { func(); } });
+                        }
+                    }
+                    if (pending == 0 && func) { func(); }
+                });
+            };
         }
 
         func(obj); // Completed function setup

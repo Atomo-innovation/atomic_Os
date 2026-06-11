@@ -1,11 +1,19 @@
 {
   "$schema": "https://raw.githubusercontent.com/Ylianst/MeshCentral/master/meshcentral-config-schema.json",
+  "smtp": {
+    "host": "smtp.gmail.com",
+    "port": 587,
+    "user": "tirthkuchara@gmail.com",
+    "pass": "zztivuvmymkkrsgy",
+    "from": "tirthkuchara@gmail.com",
+    "name": "Atomic Center"
+  },
   "settings": {
-    "cert": "192.168.1.30",
+    "cert": "192.168.1.39",
     "port": 4434,
     "mpsPort": 4433,
     "redirPort": 1024,
-    "agentaliasdns": "192.168.1.30",
+    "agentaliasdns": "192.168.1.39",
     "autobackup": {
       "backuppath": "meshcentral-data/backups"
     },
@@ -20,7 +28,7 @@
   "domains": {
     "": {
       "title": "Atomic Center",
-      "nodeLoginUrl": "http://192.168.1.30:3000",
+      "nodeLoginUrl": "http://192.168.1.39:3000",
       "newaccounts": true,
       "minify": false,
       "sitestyle": 2,

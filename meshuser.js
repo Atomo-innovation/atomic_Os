@@ -559,7 +559,7 @@ module.exports.CreateMeshUser = function (parent, db, ws, req, args, domain, use
                 mpsport: mpsport,
                 mpspass: args.mpspass,
                 port: httpport,
-                emailcheck: ((domain.mailserver != null) && (domain.auth != 'sspi') && (domain.auth != 'ldap') && (args.lanonly != true) && (parent.certificates.CommonName != null) && (parent.certificates.CommonName.indexOf('.') != -1) && (user._id.split('/')[2].startsWith('~') == false)),
+                emailcheck: false,
                 domainauth: (domain.auth == 'sspi'),
                 serverTime: Date.now(),
                 features: allFeatures.features,

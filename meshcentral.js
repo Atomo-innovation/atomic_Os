@@ -1965,6 +1965,19 @@ function CreateMeshCentralServer(config, args) {
                         obj.swarmserver = require('./swarmserver.js').CreateSwarmServer(obj, obj.db, obj.args, obj.certificates);
                     }
 
+                    // Load .env (if present) before applying SMTP environment variables
+                    try { require('./externalauth.js').getAuthApiUrl(); } catch (ex) { }
+
+                    // Apply SMTP environment variables when configured
+                    if (process.env.SMTP_HOST || process.env.SMTP_USER || process.env.SMTP_PASS) {
+                        if (obj.config.smtp == null) { obj.config.smtp = {}; }
+                        if (process.env.SMTP_HOST) { obj.config.smtp.host = process.env.SMTP_HOST; }
+                        if (process.env.SMTP_PORT) { obj.config.smtp.port = parseInt(process.env.SMTP_PORT, 10); }
+                        if (process.env.SMTP_USER) { obj.config.smtp.user = process.env.SMTP_USER; obj.config.smtp.from = process.env.SMTP_USER; }
+                        if (process.env.SMTP_PASS) { obj.config.smtp.pass = process.env.SMTP_PASS; }
+                        if (obj.config.smtp.name == null) { obj.config.smtp.name = 'Atomic Center'; }
+                    }
+
                     // Setup the main email server
                     if (obj.config.sendgrid != null) {
                         // Sendgrid server

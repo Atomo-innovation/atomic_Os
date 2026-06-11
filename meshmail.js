@@ -66,7 +66,14 @@ module.exports.CreateMeshMail = function (parent, domain) {
                 if (obj.config.smtp.auth.clientsecret) { options.auth.clientSecret = obj.config.smtp.auth.clientsecret; }
                 if (obj.config.smtp.auth.refreshtoken) { options.auth.refreshToken = obj.config.smtp.auth.refreshtoken; }
             }
-            else if ((obj.config.smtp.user != null) && (obj.config.smtp.pass != null)) { options.auth = { user: obj.config.smtp.user, pass: obj.config.smtp.pass }; }
+            else if ((obj.config.smtp.user != null) && (obj.config.smtp.pass != null)) {
+                if (obj.config.smtp.user.toLowerCase().endsWith('@gmail.com')) {
+                    options = { service: 'gmail', auth: { user: obj.config.smtp.user, pass: obj.config.smtp.pass } };
+                    obj.config.smtp.host = 'gmail';
+                } else {
+                    options.auth = { user: obj.config.smtp.user, pass: obj.config.smtp.pass };
+                }
+            }
             if (obj.config.smtp.verifyemail == true) { obj.verifyemail = true; }
 
             obj.smtpServer = nodemailer.createTransport(options);
@@ -213,6 +220,24 @@ module.exports.CreateMeshMail = function (parent, domain) {
             obj.pendingMails.push({ to: to, from: obj.config.smtp.from, subject: subject, text: text, html: html });
         }
         sendNextMail();
+    };
+
+    // Send registration OTP verification mail
+    obj.sendRegistrationOtpMail = function (domain, email, otp, func) {
+        obj.checkEmail(email, function (checked) {
+            if (!checked) { if (func) { func('invalid_email'); } return; }
+            parent.debug('email', 'Sending registration OTP to ' + email);
+            var from = null;
+            if (obj.config.sendgrid && (typeof obj.config.sendgrid.from == 'string')) { from = obj.config.sendgrid.from; }
+            else if (obj.config.smtp && (typeof obj.config.smtp.from == 'string')) { from = obj.config.smtp.from; }
+            else if (obj.config.smtp && (typeof obj.config.smtp.user == 'string')) { from = obj.config.smtp.user; }
+            var subject = 'Atomic Center Verification Code';
+            var text = 'Your Atomic Center verification code is:\n\n' + otp + '\n\nThis code expires in 10 minutes.';
+            var html = '<p>Your Atomic Center verification code is:</p><p style="font-size:24px;font-weight:bold;letter-spacing:4px;">' + otp + '</p><p>This code expires in 10 minutes.</p>';
+            obj.pendingMails.push({ to: email, from: from, subject: subject, text: text, html: html });
+            sendNextMail();
+            if (func) { func(null); }
+        });
     };
 
     // Send account login mail / 2 factor token

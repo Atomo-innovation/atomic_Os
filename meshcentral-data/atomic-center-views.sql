@@ -42,6 +42,20 @@ SELECT
 FROM main
 WHERE type = 'node';
 
+DROP VIEW IF EXISTS atomic_center_registration_otp;
+CREATE VIEW atomic_center_registration_otp AS
+SELECT
+  id,
+  email,
+  otpHash,
+  createdAt,
+  expiresAt,
+  attempts,
+  verified,
+  lastSentAt,
+  domain
+FROM registration_otp;
+
 DROP VIEW IF EXISTS atomic_center_recent_events;
 CREATE VIEW atomic_center_recent_events AS
 SELECT

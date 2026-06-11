@@ -1,9 +1,9 @@
-time=1780925600848
-state=stopped
-server-pid=17638
-server-parent-pid=17626
+time=1781161293973
+state=running
+server-pid=16695
+server-parent-pid=16683
 redirect-port=1024
 mps-port=4433
-mps-name=192.168.1.30
-servername=192.168.1.30
+mps-name=192.168.1.39
+servername=192.168.1.39
 https-port=4434

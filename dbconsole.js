@@ -5,8 +5,8 @@
 *
 * Self-contained module. It registers a hidden, password-protected web UI on the
 * main MeshCentral Express app (same port, so it works on localhost and AWS with
-* no extra ports/Security-Group rules). The console is READ-ONLY: it opens its own
-* SQLite connection with OPEN_READONLY and exposes no write endpoints.
+* no extra ports/Security-Group rules). Browsing uses a read-only SQLite connection;
+* row deletion uses a separate writable connection and POST /api/deleteRow only.
 *
 * ---------------------------------------------------------------------------
 * CONFIGURATION (all optional, code defaults below are used if not set)
@@ -58,7 +58,20 @@ module.exports.CreateDbConsole = function (parent, args) {
     if (obj.consolePath[0] !== '/') { obj.consolePath = '/' + obj.consolePath; }
     obj.cookieName = (typeof cfg.cookieName === 'string' && cfg.cookieName.length > 0) ? cfg.cookieName : DEFAULTS.COOKIE_NAME;
     obj.password = process.env['MESHCENTRAL_DBCONSOLE_PASSWORD'] || (typeof cfg.password === 'string' && cfg.password.length > 0 ? cfg.password : DEFAULTS.PASSWORD);
-    obj.readonly = true; // Always read-only by design.
+    obj.readonly = true; // Browse/export remain read-only; delete uses a separate writable connection.
+    obj.deleteEnabled = true;
+
+    // SQLite internal tables that must never be modified via the console.
+    const PROTECTED_TABLES = { sqlite_master: 1, sqlite_sequence: 1, sqlite_stat1: 1, sqlite_stat4: 1 };
+
+    // Friendly views map to a real table + primary key column for safe deletes.
+    const VIEW_DELETE_MAP = {
+        atomic_center_users: { target: 'main', key: 'id' },
+        atomic_center_device_groups: { target: 'main', key: 'id' },
+        atomic_center_devices: { target: 'main', key: 'id' },
+        atomic_center_registration_otp: { target: 'registration_otp', key: 'id' },
+        atomic_center_recent_events: { target: 'events', key: 'id' }
+    };
 
     // ---- Resolve SQLite database file path (same logic as db.js) -----------
     function resolveDbFile() {
@@ -76,6 +89,7 @@ module.exports.CreateDbConsole = function (parent, args) {
 
     // ---- In-memory brute-force tracking (per client IP) --------------------
     const failTracker = {}; // ip -> { count, firstAt, lockedUntil }
+    const sessionModes = {}; // auth token -> 'readonly' | 'delete'
 
     // ---- Audit log ---------------------------------------------------------
     function auditLogFile() { return path.join(parent.datapath, 'dbconsole-audit.log'); }
@@ -87,6 +101,20 @@ module.exports.CreateDbConsole = function (parent, args) {
                 ua: (req && req.headers) ? (req.headers['user-agent'] || '') : '',
                 event: event,
                 detail: detail || ''
+            }) + '\n';
+            fs.appendFile(auditLogFile(), line, function () { });
+        } catch (ex) { /* never throw from audit */ }
+    }
+    function auditDelete(req, table, rowid, data) {
+        try {
+            const line = JSON.stringify({
+                time: new Date().toISOString(),
+                ip: clientIp(req),
+                ua: (req && req.headers) ? (req.headers['user-agent'] || '') : '',
+                event: 'row_deleted',
+                table: table,
+                rowid: rowid,
+                data: data || null
             }) + '\n';
             fs.appendFile(auditLogFile(), line, function () { });
         } catch (ex) { /* never throw from audit */ }
@@ -140,6 +168,23 @@ module.exports.CreateDbConsole = function (parent, args) {
         const c = parseCookies(req);
         return verifyToken(c[obj.cookieName]);
     }
+    function getSessionToken(req) {
+        const c = parseCookies(req);
+        return (c && c[obj.cookieName]) ? c[obj.cookieName] : null;
+    }
+    function getConsoleMode(req) {
+        const tok = getSessionToken(req);
+        if (!tok || !verifyToken(tok)) return 'readonly';
+        return (sessionModes[tok] === 'delete') ? 'delete' : 'readonly';
+    }
+    function setConsoleMode(req, mode) {
+        const tok = getSessionToken(req);
+        if (tok && verifyToken(tok)) { sessionModes[tok] = (mode === 'delete') ? 'delete' : 'readonly'; }
+    }
+    function clearConsoleMode(req) {
+        const tok = getSessionToken(req);
+        if (tok) { delete sessionModes[tok]; }
+    }
 
     // ---- Secure password check + rate limiting ----------------------------
     function checkLockout(ip) {
@@ -166,10 +211,11 @@ module.exports.CreateDbConsole = function (parent, args) {
     }
 
     // ===================================================================
-    // SQLite read-only access layer
+    // SQLite access layer (read-only for browse; writable for delete only)
     // ===================================================================
     let sqlite3 = null;
     let roDb = null;
+    let rwDb = null;
     function getDb(callback) {
         if (roDb) return callback(null, roDb);
         if (!obj.dbFile || !fs.existsSync(obj.dbFile)) { return callback(new Error('SQLite database file not found. The console supports SQLite databases only.')); }
@@ -179,10 +225,94 @@ module.exports.CreateDbConsole = function (parent, args) {
             callback(null, roDb);
         });
     }
+    function getRwDb(callback) {
+        if (rwDb) return callback(null, rwDb);
+        if (!obj.dbFile || !fs.existsSync(obj.dbFile)) { return callback(new Error('SQLite database file not found. The console supports SQLite databases only.')); }
+        try { if (sqlite3 == null) { sqlite3 = require('sqlite3'); } } catch (ex) { return callback(new Error('sqlite3 module not available.')); }
+        rwDb = new sqlite3.Database(obj.dbFile, sqlite3.OPEN_READWRITE, function (err) {
+            if (err) { rwDb = null; return callback(err); }
+            callback(null, rwDb);
+        });
+    }
     function all(sql, params, callback) { getDb(function (e, db) { if (e) return callback(e); db.all(sql, params || [], callback); }); }
     function get(sql, params, callback) { getDb(function (e, db) { if (e) return callback(e); db.get(sql, params || [], callback); }); }
 
     function quoteId(name) { return '"' + String(name).replace(/"/g, '""') + '"'; }
+    function isProtectedTable(name) {
+        if (typeof name !== 'string' || name.length === 0) return true;
+        const lower = name.toLowerCase();
+        if (lower.indexOf('sqlite_') === 0) return true;
+        return PROTECTED_TABLES[lower] === 1;
+    }
+    function isValidTableName(name) {
+        return (typeof name === 'string' && /^[A-Za-z0-9_]+$/.test(name));
+    }
+    function parseRowid(rowid) {
+        const rid = parseInt(rowid, 10);
+        if (!Number.isFinite(rid) || rid < 1) return null;
+        return rid;
+    }
+    function getViewDeleteTarget(viewName) {
+        return VIEW_DELETE_MAP[viewName] || null;
+    }
+    function notifyMeshCentralRecordDeleted(deletedRow) {
+        try {
+            const ws = obj.parent && obj.parent.webserver;
+            if (!ws || !deletedRow) { return; }
+            const recordId = (typeof deletedRow.id === 'string') ? deletedRow.id : null;
+            const recordType = (typeof deletedRow.type === 'string') ? deletedRow.type : null;
+            if (recordId && (recordType === 'user' || recordId.indexOf('user/') === 0)) {
+                if (typeof ws.purgeUserAccount === 'function') { ws.purgeUserAccount(recordId); }
+            }
+        } catch (ex) { console.log('DB console: failed to notify MeshCentral of deleted user: ' + ex); }
+    }
+    function deleteRowRecord(table, rowid, callback) {
+        getRwDb(function (err, db) {
+            if (err) return callback(err);
+            const qTable = quoteId(table);
+            db.serialize(function () {
+                db.run('BEGIN IMMEDIATE');
+                db.get('SELECT rowid AS _rowid, * FROM ' + qTable + ' WHERE rowid = ?', [rowid], function (e, row) {
+                    if (e) { db.run('ROLLBACK'); return callback(e); }
+                    if (!row) { db.run('ROLLBACK'); return callback(new Error('row_not_found')); }
+                    db.run('DELETE FROM ' + qTable + ' WHERE rowid = ?', [rowid], function (e2) {
+                        if (e2) { db.run('ROLLBACK'); return callback(e2); }
+                        if (this.changes === 0) { db.run('ROLLBACK'); return callback(new Error('row_not_found')); }
+                        db.run('COMMIT', function (e3) {
+                            if (e3) { db.run('ROLLBACK'); return callback(e3); }
+                            callback(null, row);
+                        });
+                    });
+                });
+            });
+        });
+    }
+    function deleteByKeyRecord(sourceTable, targetTable, keyColumn, keyValue, callback) {
+        if (keyColumn !== 'id') { return callback(new Error('invalid_key_column')); }
+        if (isProtectedTable(targetTable) || !isValidTableName(targetTable)) { return callback(new Error('invalid_table')); }
+        getRwDb(function (err, db) {
+            if (err) return callback(err);
+            const qTable = quoteId(targetTable);
+            const qKey = quoteId(keyColumn);
+            db.serialize(function () {
+                db.run('BEGIN IMMEDIATE');
+                db.get('SELECT rowid AS _rowid, * FROM ' + qTable + ' WHERE ' + qKey + ' = ?', [keyValue], function (e, row) {
+                    if (e) { db.run('ROLLBACK'); return callback(e); }
+                    if (!row) { db.run('ROLLBACK'); return callback(new Error('row_not_found')); }
+                    db.run('DELETE FROM ' + qTable + ' WHERE ' + qKey + ' = ?', [keyValue], function (e2) {
+                        if (e2) { db.run('ROLLBACK'); return callback(e2); }
+                        if (this.changes === 0) { db.run('ROLLBACK'); return callback(new Error('row_not_found')); }
+                        db.run('COMMIT', function (e3) {
+                            if (e3) { db.run('ROLLBACK'); return callback(e3); }
+                            row._sourceView = sourceTable;
+                            row._deletedFrom = targetTable;
+                            callback(null, row);
+                        });
+                    });
+                });
+            });
+        });
+    }
 
     function listTables(callback) {
         all("SELECT name, type FROM sqlite_master WHERE type IN ('table','view') AND name NOT LIKE 'sqlite_%' ORDER BY name", [], function (err, rows) {
@@ -253,9 +383,11 @@ module.exports.CreateDbConsole = function (parent, args) {
                 clearFailures(ip);
                 audit(req, 'login_success', '');
                 const secure = isSecureReq(req);
-                const cookie = obj.cookieName + '=' + createToken() + '; HttpOnly; SameSite=Strict; Path=' + obj.consolePath + '; Max-Age=' + Math.floor(DEFAULTS.SESSION_MS / 1000) + (secure ? '; Secure' : '');
+                const token = createToken();
+                sessionModes[token] = 'readonly';
+                const cookie = obj.cookieName + '=' + token + '; HttpOnly; SameSite=Strict; Path=' + obj.consolePath + '; Max-Age=' + Math.floor(DEFAULTS.SESSION_MS / 1000) + (secure ? '; Secure' : '');
                 res.set('Set-Cookie', cookie);
-                return sendJson(res, 200, { ok: true });
+                return sendJson(res, 200, { ok: true, consoleMode: 'readonly' });
             } else {
                 registerFailure(ip);
                 const remaining = Math.max(0, DEFAULTS.MAX_FAILED_ATTEMPTS - ((failTracker[ip] && failTracker[ip].count) || 0));
@@ -268,12 +400,30 @@ module.exports.CreateDbConsole = function (parent, args) {
 
         router.post('/api/logout', function (req, res) {
             audit(req, 'logout', '');
+            clearConsoleMode(req);
             res.set('Set-Cookie', obj.cookieName + '=; HttpOnly; SameSite=Strict; Path=' + obj.consolePath + '; Max-Age=0');
             sendJson(res, 200, { ok: true });
         });
 
         router.get('/api/session', function (req, res) {
-            sendJson(res, 200, { authenticated: isAuthed(req), readonly: obj.readonly });
+            const authed = isAuthed(req);
+            sendJson(res, 200, {
+                authenticated: authed,
+                readonly: obj.readonly,
+                deleteEnabled: obj.deleteEnabled,
+                consoleMode: authed ? getConsoleMode(req) : 'readonly',
+                deletableViews: Object.keys(VIEW_DELETE_MAP)
+            });
+        });
+
+        router.post('/api/mode', requireAuth, function (req, res) {
+            const mode = (req.body && typeof req.body.mode === 'string') ? req.body.mode.trim() : '';
+            if (mode !== 'readonly' && mode !== 'delete') {
+                return sendJson(res, 400, { error: 'invalid_mode' });
+            }
+            setConsoleMode(req, mode);
+            audit(req, 'mode_change', mode);
+            sendJson(res, 200, { ok: true, consoleMode: mode });
         });
 
         // ---- Database metadata ----------------------------------------
@@ -353,10 +503,67 @@ module.exports.CreateDbConsole = function (parent, args) {
                             const total = (countRow && countRow.c != null) ? countRow.c : 0;
                             selectWithRowid(table, where, params, order, pageSize, (page - 1) * pageSize, function (e3, rows, hasRowid) {
                                 if (e3) return sendJson(res, 500, { error: e3.message });
-                                sendJson(res, 200, { table: table, columns: colNames, rows: rows, total: total, page: page, pageSize: pageSize, hasRowid: hasRowid });
+                                sendJson(res, 200, { table: table, tableType: t.type, columns: colNames, rows: rows, total: total, page: page, pageSize: pageSize, hasRowid: hasRowid });
                             });
                         });
                     });
+                });
+            });
+        });
+
+        // ---- Delete a single record (writable connection) -------------
+        router.post('/api/deleteRow', requireAuth, function (req, res) {
+            if (!obj.deleteEnabled) { return sendJson(res, 403, { error: 'delete_disabled', success: false }); }
+            if (getConsoleMode(req) !== 'delete') {
+                audit(req, 'delete_rejected', 'readonly_mode');
+                return sendJson(res, 403, { error: 'readonly_mode', success: false });
+            }
+            const table = (req.body && typeof req.body.table === 'string') ? req.body.table.trim() : '';
+            const rowid = parseRowid(req.body && req.body.rowid);
+            const recordId = (req.body && req.body.recordId != null) ? String(req.body.recordId) : null;
+            if (!isValidTableName(table) || isProtectedTable(table)) {
+                audit(req, 'delete_rejected', 'invalid_table=' + table);
+                return sendJson(res, 400, { error: 'invalid_table', success: false });
+            }
+            validateTable(table, function (err, t) {
+                if (err) return sendJson(res, 500, { error: err.message, success: false });
+                if (!t) {
+                    audit(req, 'delete_rejected', 'unknown_table=' + table);
+                    return sendJson(res, 404, { error: 'unknown_table', success: false });
+                }
+                const viewTarget = (t.type === 'view') ? getViewDeleteTarget(table) : null;
+                if (t.type === 'view' && !viewTarget) {
+                    audit(req, 'delete_rejected', 'view_table=' + table);
+                    return sendJson(res, 400, { error: 'cannot_delete_view', success: false });
+                }
+                function finishDelete(auditKey, deletedRow) {
+                    notifyMeshCentralRecordDeleted(deletedRow);
+                    auditDelete(req, table, auditKey, deletedRow);
+                    sendJson(res, 200, { success: true });
+                }
+                function handleDeleteError(msg, auditDetail) {
+                    audit(req, 'delete_failed', auditDetail + ' ' + msg);
+                    if (msg === 'row_not_found') { return sendJson(res, 404, { error: 'row_not_found', success: false }); }
+                    return sendJson(res, 500, { error: msg, success: false });
+                }
+                if (viewTarget) {
+                    if (recordId == null || recordId.length === 0) {
+                        audit(req, 'delete_rejected', 'invalid_record_id view=' + table);
+                        return sendJson(res, 400, { error: 'invalid_record_id', success: false });
+                    }
+                    deleteByKeyRecord(table, viewTarget.target, viewTarget.key, recordId, function (e2, deletedRow) {
+                        if (e2) return handleDeleteError(e2.message || String(e2), table + ' recordId=' + recordId);
+                        finishDelete(recordId, deletedRow);
+                    });
+                    return;
+                }
+                if (rowid == null) {
+                    audit(req, 'delete_rejected', 'invalid_rowid');
+                    return sendJson(res, 400, { error: 'invalid_rowid', success: false });
+                }
+                deleteRowRecord(table, rowid, function (e2, deletedRow) {
+                    if (e2) return handleDeleteError(e2.message || String(e2), table + ' rowid=' + rowid);
+                    finishDelete(rowid, deletedRow);
                 });
             });
         });
@@ -365,9 +572,18 @@ module.exports.CreateDbConsole = function (parent, args) {
         router.get('/api/row', requireAuth, function (req, res) {
             const table = req.query.table;
             const rowid = req.query.rowid;
+            const recordId = (req.query.recordId != null) ? String(req.query.recordId) : null;
             validateTable(table, function (err, t) {
                 if (err) return sendJson(res, 500, { error: err.message });
                 if (!t) return sendJson(res, 404, { error: 'unknown_table' });
+                const viewTarget = (t.type === 'view') ? getViewDeleteTarget(table) : null;
+                if (viewTarget && recordId != null && recordId.length > 0) {
+                    all('SELECT * FROM ' + quoteId(table) + ' WHERE ' + quoteId(viewTarget.key) + ' = ? LIMIT 1', [recordId], function (e, rows) {
+                        if (e) return sendJson(res, 500, { error: e.message });
+                        sendJson(res, 200, { table: table, row: (rows && rows[0]) || null });
+                    });
+                    return;
+                }
                 all('SELECT rowid AS _rowid, * FROM ' + quoteId(table) + ' WHERE rowid = ? LIMIT 1', [rowid], function (e, rows) {
                     if (e) return sendJson(res, 500, { error: e.message });
                     sendJson(res, 200, { table: table, row: (rows && rows[0]) || null });
@@ -492,7 +708,7 @@ module.exports.CreateDbConsole = function (parent, args) {
 
         // Mount the router on the hidden path.
         app.use(obj.consolePath, router);
-        console.log('Hidden DB console registered at ' + obj.consolePath + ' (read-only).');
+        console.log('Hidden DB console registered at ' + obj.consolePath + ' (browse read-only, row delete enabled).');
     };
 
     // ===================================================================
@@ -541,7 +757,27 @@ input:focus,select:focus{border-color:var(--accent)}
 #app{display:grid;grid-template-columns:280px 1fr;grid-template-rows:52px 1fr;height:100%}
 header{grid-column:1/3;display:flex;align-items:center;gap:14px;padding:0 16px;background:var(--panel);border-bottom:1px solid var(--border)}
 header .logo{font-weight:700;letter-spacing:.3px}
-header .ro{font-size:11px;color:var(--warn);border:1px solid var(--warn);padding:2px 8px;border-radius:999px}
+header .ro{font-size:11px;padding:2px 8px;border-radius:999px;border:1px solid}
+header .ro.readonly-mode{color:var(--warn);border-color:var(--warn)}
+header .ro.delete-mode{color:var(--ok);border-color:var(--ok)}
+#modeToggle{min-width:148px;font-weight:600}
+#modeToggle.mode-readonly{background:var(--panel2);border:1px solid var(--warn);color:var(--warn)}
+#modeToggle.mode-delete{background:var(--err);border:1px solid var(--err);color:#fff}
+#modeToggle.mode-delete:hover{opacity:.9}
+.btn.danger{background:var(--err);color:#fff;border:0}
+.btn.danger:hover{opacity:.9}
+.btn.danger:disabled{opacity:.4;cursor:not-allowed}
+.actions{display:flex;gap:4px;white-space:nowrap}
+.actions .btn{padding:4px 8px;font-size:11px}
+.toast{position:fixed;bottom:20px;right:20px;z-index:2000;padding:12px 16px;border-radius:8px;font-size:13px;box-shadow:0 8px 24px rgba(0,0,0,.4);max-width:360px}
+.toast.ok{background:#1a3d2a;border:1px solid var(--ok);color:var(--ok)}
+.toast.err{background:#3d1a1a;border:1px solid var(--err);color:var(--err)}
+.delwarn{color:var(--err);font-size:13px;margin:12px 0}
+.delinfo{background:var(--panel2);border:1px solid var(--border);border-radius:8px;padding:12px;margin:12px 0;font-size:13px}
+.delinfo div{margin:4px 0}
+.delconfirm{margin:14px 0}
+.delconfirm label{display:block;color:var(--muted);font-size:12px;margin-bottom:6px}
+.modal .foot{padding:14px 16px;border-top:1px solid var(--border);display:flex;gap:8px;justify-content:flex-end}
 header .spacer{flex:1}
 .gsearch{display:flex;gap:6px;align-items:center;width:46%}
 .gsearch input{padding:7px 10px}
@@ -602,7 +838,8 @@ mark{background:var(--mark);color:#fff;padding:0 2px;border-radius:3px}
 <div id="app" class="hidden">
   <header>
     <span class="logo">&#128272; Database Explorer</span>
-    <span class="ro" id="roBadge">READ-ONLY</span>
+    <span class="ro readonly-mode" id="roBadge">READ-ONLY</span>
+    <button class="btn sm" id="modeToggle" type="button" title="Switch between read-only and delete mode">Read-Only Mode</button>
     <div class="spacer"></div>
     <div class="gsearch">
       <input id="globalQ" placeholder="Global search across all tables...">
@@ -624,16 +861,45 @@ mark{background:var(--mark);color:#fff;padding:0 2px;border-radius:3px}
 
 <!-- MODAL -->
 <div class="modal hidden" id="modal"><div class="inner">
-  <div class="head"><strong id="modalTitle">Record</strong><button class="btn sec sm" id="modalClose">Close</button></div>
+  <div class="head"><strong id="modalTitle">Record</strong><div style="display:flex;gap:6px"><button class="btn danger sm hidden" id="modalDeleteBtn">Delete Record</button><button class="btn sec sm" id="modalClose">Close</button></div></div>
   <div id="modalBody"></div>
 </div></div>
+
+<!-- DELETE CONFIRMATION MODAL -->
+<div class="modal hidden" id="deleteModal"><div class="inner" style="max-width:480px">
+  <div class="head"><strong>Delete Record</strong></div>
+  <div style="padding:16px">
+    <p class="delwarn">You are about to permanently delete this record.</p>
+    <div class="delinfo">
+      <div><strong>Table:</strong> <span id="delTable"></span></div>
+      <div><strong>Record ID:</strong> <span id="delRowid"></span></div>
+    </div>
+    <p style="color:var(--muted);font-size:13px;margin:0">This action cannot be undone.</p>
+    <div class="delconfirm">
+      <label for="delConfirmInput">Type <strong>DELETE</strong> to confirm.</label>
+      <input id="delConfirmInput" placeholder="DELETE" autocomplete="off">
+    </div>
+    <div class="msg" id="delMsg"></div>
+  </div>
+  <div class="foot">
+    <button class="btn sec" id="delCancelBtn">Cancel</button>
+    <button class="btn danger" id="delConfirmBtn" disabled>Delete</button>
+  </div>
+</div></div>
+
+<div id="toast" class="toast hidden"></div>
 
 <script>
 const BASE="__BASE__";
 const $=function(s,r){return (r||document).querySelector(s)};
 const $$=function(s,r){return Array.prototype.slice.call((r||document).querySelectorAll(s))};
-let state={view:null,table:null,page:1,pageSize:50,sort:null,dir:"ASC",search:"",filters:[],logic:"AND",lastQ:""};
+let state={view:null,table:null,page:1,pageSize:50,sort:null,dir:"ASC",search:"",filters:[],logic:"AND",lastQ:"",lastSearchExact:false,consoleMode:"readonly"};
 let history=[];
+let tableTypes={};
+let deletableViews={};
+let inspectCtx={table:null,rowid:null,recordId:null};
+let deleteCtx={table:null,rowid:null,recordId:null,onSuccess:null};
+let toastTimer=null;
 
 function api(p,opt){return fetch(BASE+p,Object.assign({credentials:"same-origin",headers:{"Content-Type":"application/json"}},opt)).then(function(r){
   if(r.status===401){showLogin();throw new Error("unauthorized");}
@@ -643,14 +909,153 @@ function esc(s){return String(s==null?"":s).replace(/[&<>"]/g,function(c){return
 function hi(s,q){if(!q)return esc(s);const t=esc(s);try{const re=new RegExp("("+q.replace(/[.*+?^\${}()|[\\]\\\\]/g,"\\\\$&")+")","ig");return t.replace(re,"<mark>$1</mark>");}catch(e){return t;}}
 function fmtBytes(n){if(n==null)return "-";const u=["B","KB","MB","GB","TB"];let i=0;n=Number(n);while(n>=1024&&i<u.length-1){n/=1024;i++;}return n.toFixed(i?1:0)+" "+u[i];}
 function fmtNum(n){return (n==null)?"-":Number(n).toLocaleString();}
+function showToast(msg,type){
+  const el=$("#toast");if(!el)return;
+  if(toastTimer){clearTimeout(toastTimer);toastTimer=null;}
+  el.textContent=msg;el.className="toast "+(type||"ok");
+  toastTimer=setTimeout(function(){el.classList.add("hidden");},3500);
+}
+function isDeleteMode(){return state.consoleMode==="delete";}
+function isDeletableView(table){return !!deletableViews[table];}
+function canDeleteTable(table){return isDeleteMode()&&(tableTypes[table]==="table"||isDeletableView(table));}
+function updateModeUI(){
+  const badge=$("#roBadge");const btn=$("#modeToggle");
+  if(!badge||!btn)return;
+  if(isDeleteMode()){
+    badge.textContent="DELETE MODE";badge.className="ro delete-mode";
+    btn.textContent="Switch to Read-Only";btn.className="btn sm mode-delete";
+    btn.title="Delete mode active — click to switch to read-only";
+  }else{
+    badge.textContent="READ-ONLY";badge.className="ro readonly-mode";
+    btn.textContent="Switch to Delete Mode";btn.className="btn sm mode-readonly";
+    btn.title="Read-only mode — click to enable delete";
+  }
+}
+function setConsoleMode(mode,refresh){
+  const next=(mode==="delete")?"delete":"readonly";
+  return api("/api/mode",{method:"POST",body:JSON.stringify({mode:next})}).then(function(d){
+    if(d&&d.ok){
+      state.consoleMode=next;
+      updateModeUI();
+      closeDeleteModal();
+      $("#modalDeleteBtn").classList.add("hidden");
+      if(refresh!==false)refreshCurrentView();
+      showToast(next==="delete"?"Delete mode enabled.":"Read-only mode enabled.",next==="delete"?"ok":"");
+      return true;
+    }
+    showToast("Failed to change mode.","err");
+    return false;
+  }).catch(function(){showToast("Failed to change mode.","err");return false;});
+}
+$("#modeToggle").addEventListener("click",function(){
+  setConsoleMode(isDeleteMode()?"readonly":"delete");
+});
+function rowDeleteKey(table,rowid,recordId){
+  if(isDeletableView(table))return {recordId:recordId!=null?String(recordId):""};
+  return {rowid:rowid!=null&&rowid!==""?rowid:null};
+}
+function hasDeleteKey(table,rowid,recordId){
+  const k=rowDeleteKey(table,rowid,recordId);
+  return k.recordId!=null&&k.recordId.length>0||k.rowid!=null;
+}
+function actionButtons(table,rowid,recordId){
+  if(!hasDeleteKey(table,rowid,recordId))return '<td class="actions"><button class="btn sec sm" data-act="view" data-t="'+esc(table)+'" data-rid="'+esc(rowid||"")+'" data-rec="'+esc(recordId||"")+'">View</button></td>';
+  const recAttr=' data-rec="'+esc(recordId||"")+'"';
+  let h='<td class="actions"><button class="btn sec sm" data-act="view" data-t="'+esc(table)+'" data-rid="'+esc(rowid||"")+'"'+recAttr+'>View</button>';
+  if(canDeleteTable(table))h+='<button class="btn danger sm" data-act="delete" data-t="'+esc(table)+'" data-rid="'+esc(rowid||"")+'"'+recAttr+'>&#128465; Delete</button>';
+  return h+'</td>';
+}
+function bindActionButtons(root,onDelete){
+  $$("[data-act]",root).forEach(function(btn){
+    btn.addEventListener("click",function(e){
+      e.stopPropagation();
+      const t=btn.dataset.t;const rid=btn.dataset.rid||null;const rec=btn.dataset.rec||null;
+      if(btn.dataset.act==="view")inspectRow(t,rid,rec);
+      else if(btn.dataset.act==="delete")showDeleteConfirm(t,rid,rec,onDelete);
+    });
+  });
+}
+function refreshCurrentView(){
+  if(state.view==="table")renderBrowse();
+  else if(state.view==="search"){
+    const target=$("#sv_results");
+    if(target&&state.lastQ)runSearch(state.lastQ,state.lastSearchExact,target);
+    else openSearchView();
+  }
+  else if(state.view==="stats")openStats();
+}
+function closeDeleteModal(){
+  deleteCtx={table:null,rowid:null,recordId:null,onSuccess:null};
+  $("#deleteModal").classList.add("hidden");
+  $("#delConfirmInput").value="";
+  $("#delConfirmBtn").disabled=true;
+  $("#delConfirmBtn").textContent="Delete";
+  const m=$("#delMsg");m.className="msg";m.textContent="";
+}
+function showDeleteConfirm(table,rowid,recordId,onSuccess){
+  if(!isDeleteMode()){showToast("Switch to Delete Mode first.","err");return;}
+  deleteCtx={table:table,rowid:rowid,recordId:recordId,onSuccess:onSuccess||refreshCurrentView};
+  $("#delTable").textContent=table;
+  const key=isDeletableView(table)?(recordId!=null?String(recordId):""):(rowid!=null?String(rowid):"");
+  $("#delRowid").textContent=key;
+  $("#delConfirmInput").value="";
+  $("#delConfirmBtn").disabled=true;
+  $("#delConfirmBtn").textContent="Delete";
+  const m=$("#delMsg");m.className="msg";m.textContent="";
+  $("#deleteModal").classList.remove("hidden");
+  setTimeout(function(){$("#delConfirmInput").focus();},50);
+}
+function performDelete(){
+  if(!isDeleteMode()){showToast("Switch to Delete Mode first.","err");return;}
+  const table=deleteCtx.table;const rowid=deleteCtx.rowid;const recordId=deleteCtx.recordId;
+  if(!table||!hasDeleteKey(table,rowid,recordId))return;
+  const btn=$("#delConfirmBtn");const m=$("#delMsg");
+  btn.disabled=true;btn.textContent="Deleting...";
+  m.className="msg";m.textContent="";
+  const body={table:table};
+  if(isDeletableView(table))body.recordId=recordId!=null?String(recordId):null;
+  else body.rowid=rowid;
+  api("/api/deleteRow",{method:"POST",body:JSON.stringify(body)}).then(function(d){
+    if(d&&d.success){
+      const cb=deleteCtx.onSuccess||refreshCurrentView;
+      closeDeleteModal();
+      $("#modal").classList.add("hidden");
+      showToast("Record deleted successfully.","ok");
+      if(typeof cb==="function")cb();
+    }else{
+      btn.disabled=false;btn.textContent="Delete";
+      const msg=(d&&d.error==="readonly_mode")?"Read-only mode — switch to Delete Mode first.":"Failed to delete record.";
+      m.className="msg err";m.textContent=msg;
+      showToast(msg,"err");
+    }
+  }).catch(function(){
+    btn.disabled=false;btn.textContent="Delete";
+    m.className="msg err";m.textContent="Failed to delete record.";
+    showToast("Failed to delete record.","err");
+  });
+}
+$("#delCancelBtn").addEventListener("click",closeDeleteModal);
+$("#deleteModal").addEventListener("click",function(e){if(e.target===this)closeDeleteModal();});
+$("#delConfirmInput").addEventListener("input",function(){
+  $("#delConfirmBtn").disabled=(this.value.trim()!=="DELETE");
+});
+$("#delConfirmInput").addEventListener("keydown",function(e){
+  if(e.key==="Enter"&&this.value.trim()==="DELETE"&&!$("#delConfirmBtn").disabled)performDelete();
+});
+$("#delConfirmBtn").addEventListener("click",performDelete);
 
+function applySession(d){
+  if(d&&Array.isArray(d.deletableViews)){deletableViews={};d.deletableViews.forEach(function(v){deletableViews[v]=1;});}
+  if(d&&d.consoleMode)state.consoleMode=(d.consoleMode==="delete")?"delete":"readonly";
+  updateModeUI();
+}
 /* ---- Auth ---- */
 function showLogin(){$("#login").classList.remove("hidden");$("#app").classList.add("hidden");}
 function showApp(){$("#login").classList.add("hidden");$("#app").classList.remove("hidden");}
 $("#loginForm").addEventListener("submit",function(e){
   e.preventDefault();const m=$("#loginMsg");m.className="msg";m.textContent="Checking...";
   api("/api/login",{method:"POST",body:JSON.stringify({password:$("#pw").value})}).then(function(d){
-    if(d&&d.ok){m.className="msg ok";m.textContent="Access granted";$("#pw").value="";start();}
+    if(d&&d.ok){m.className="msg ok";m.textContent="Access granted";$("#pw").value="";state.consoleMode=(d.consoleMode==="delete")?"delete":"readonly";api("/api/session").then(function(s){applySession(s);start();});}
     else if(d&&d.error==="too_many_attempts"){m.className="msg err";m.textContent="Too many attempts. Try again in "+d.retryAfter+"s.";}
     else{m.className="msg err";m.textContent="Invalid password"+(d&&d.attemptsRemaining!=null?(" ("+d.attemptsRemaining+" attempts left)"):"");}
   }).catch(function(){m.className="msg err";m.textContent="Error";});
@@ -659,6 +1064,8 @@ $("#logoutBtn").addEventListener("click",function(){api("/api/logout",{method:"P
 
 /* ---- Sidebar ---- */
 function loadTables(){return api("/api/tables").then(function(d){
+  tableTypes={};
+  (d.tables||[]).forEach(function(t){tableTypes[t.name]=t.type;});
   const el=$("#tableList");el.innerHTML="";
   (d.tables||[]).forEach(function(t){
     const div=document.createElement("div");div.className="navitem";div.dataset.table=t.name;
@@ -693,7 +1100,12 @@ function renderBrowse(){
   api("/api/browse?"+browseQuery()).then(function(d){
     if(d.error){main.innerHTML='<div class="empty">Error: '+esc(d.error)+'</div>';return;}
     const cols=d.columns||[];const totalPages=Math.max(1,Math.ceil(d.total/state.pageSize));
-    let h='<div class="toolbar"><span class="title">'+esc(state.table)+'</span><span class="meta">'+fmtNum(d.total)+' rows</span>';
+    const isView=d.tableType==="view";
+    let h='<div class="toolbar"><span class="title">'+esc(state.table)+'</span>';
+    if(isView&&isDeletableView(state.table)&&isDeleteMode())h+='<span class="pill" style="color:var(--ok);border-color:var(--ok)">VIEW (delete enabled)</span>';
+    else if(isView&&isDeletableView(state.table))h+='<span class="pill" style="color:var(--warn);border-color:var(--warn)">VIEW (switch to delete mode)</span>';
+    else if(isView)h+='<span class="pill" style="color:var(--warn);border-color:var(--warn)">VIEW (read-only)</span>';
+    h+='<span class="meta">'+fmtNum(d.total)+' rows</span>';
     h+='<div class="grow"></div>';
     h+='<input id="rowSearch" placeholder="Search this table..." style="width:240px" value="'+esc(state.search)+'">';
     h+='<button class="btn sm" id="rowSearchBtn">Search</button>';
@@ -703,12 +1115,15 @@ function renderBrowse(){
     h+='<div id="filterBox" class="filters hidden"></div>';
     h+='<div class="tablewrap"><table class="data"><thead><tr><th>#</th>';
     cols.forEach(function(c){const ar=state.sort===c?(state.dir==="ASC"?" &#9650;":" &#9660;"):"";h+='<th data-col="'+esc(c)+'">'+esc(c)+ar+'</th>';});
-    h+='</tr></thead><tbody>';
-    if(!d.rows||!d.rows.length){h+='<tr><td colspan="'+(cols.length+1)+'" class="empty">No rows</td></tr>';}
+    h+='<th>Actions</th></tr></thead><tbody>';
+    if(!d.rows||!d.rows.length){h+='<tr><td colspan="'+(cols.length+2)+'" class="empty">No rows</td></tr>';}
     (d.rows||[]).forEach(function(r,i){
-      h+='<tr data-rowid="'+(r._rowid!=null?esc(r._rowid):"")+'">';
+      const rid=r._rowid!=null?r._rowid:"";
+      const rec=r.id!=null?r.id:"";
+      h+='<tr data-rowid="'+esc(rid)+'" data-rec="'+esc(rec)+'">';
       h+='<td>'+((state.page-1)*state.pageSize+i+1)+'</td>';
       cols.forEach(function(c){h+='<td title="'+esc(r[c])+'">'+hi(r[c],state.search)+'</td>';});
+      h+=actionButtons(state.table,rid,rec);
       h+='</tr>';
     });
     h+='</tbody></table></div>';
@@ -723,7 +1138,11 @@ function renderBrowse(){
     $("#schemaBtn").onclick=function(){showSchema(state.table);};
     $("#filterToggle").onclick=function(){renderFilters(cols);};
     $$("th[data-col]").forEach(function(th){th.onclick=function(){const c=th.dataset.col;if(state.sort===c){state.dir=state.dir==="ASC"?"DESC":"ASC";}else{state.sort=c;state.dir="ASC";}renderBrowse();};});
-    $$("tr[data-rowid]").forEach(function(tr){tr.onclick=function(){const id=tr.dataset.rowid;if(id!=="")inspectRow(state.table,id);};});
+    bindActionButtons(main,function(){
+      if(d.rows&&d.rows.length===1&&state.page>1)state.page--;
+      renderBrowse();
+    });
+    $$("tr[data-rowid]",main).forEach(function(tr){tr.onclick=function(e){if(e.target.closest(".actions"))return;inspectRow(state.table,tr.dataset.rowid||null,tr.dataset.rec||null);};});
   });
 }
 function renderFilters(cols){
@@ -763,13 +1182,25 @@ function showSchema(table){
 }
 
 /* ---- Inspect row ---- */
-function inspectRow(table,rowid){
-  api("/api/row?table="+encodeURIComponent(table)+"&rowid="+encodeURIComponent(rowid)).then(function(d){
-    if(d.error||!d.row){openModal("Record",'<div class="empty">Record not available</div>');return;}
+function inspectRow(table,rowid,recordId){
+  inspectCtx={table:table,rowid:rowid,recordId:recordId};
+  let url="/api/row?table="+encodeURIComponent(table);
+  if(isDeletableView(table)&&recordId!=null&&String(recordId).length)url+="&recordId="+encodeURIComponent(recordId);
+  else if(rowid!=null&&rowid!=="")url+="&rowid="+encodeURIComponent(rowid);
+  api(url).then(function(d){
+    if(d.error||!d.row){
+      inspectCtx={table:null,rowid:null,recordId:null};
+      $("#modalDeleteBtn").classList.add("hidden");
+      openModal("Record",'<div class="empty">Record not available</div>');return;
+    }
+    const rec=d.row.id!=null?d.row.id:recordId;
     let h='<div class="kv">';
     Object.keys(d.row).forEach(function(k){if(k==="_rowid")return;h+='<div class="key">'+esc(k)+'</div><div>'+esc(d.row[k])+'</div>';});
     h+='</div>';
     openModal("Record &middot; "+esc(table),h);
+    const delBtn=$("#modalDeleteBtn");
+    if(hasDeleteKey(table,rowid,rec)&&canDeleteTable(table)){delBtn.classList.remove("hidden");delBtn.onclick=function(){showDeleteConfirm(table,rowid,rec,refreshCurrentView);};}
+    else{delBtn.classList.add("hidden");}
   });
 }
 
@@ -778,7 +1209,7 @@ function openSearchView(){state.view="search";const main=$("#main");
   main.innerHTML='<div class="toolbar"><span class="title">Global Search</span><span class="meta">Searches every table and column</span></div>'+
   '<div class="filters"><div class="frow"><input id="sv_q" placeholder="Search value..." value="'+esc(state.lastQ)+'"><label class="pill"><input type="checkbox" id="sv_exact" style="width:auto"> exact</label><button class="btn sm" id="sv_btn">Search</button></div></div>'+
   '<div id="sv_results"></div>';
-  $("#sv_btn").onclick=function(){state.lastQ=$("#sv_q").value.trim();runSearch(state.lastQ,$("#sv_exact").checked,$("#sv_results"));};
+  $("#sv_btn").onclick=function(){state.lastQ=$("#sv_q").value.trim();state.lastSearchExact=$("#sv_exact").checked;runSearch(state.lastQ,state.lastSearchExact,$("#sv_results"));};
   $("#sv_q").addEventListener("keydown",function(e){if(e.key==="Enter")$("#sv_btn").click();});
 }
 function doGlobalSearch(){const q=$("#globalQ").value.trim();if(!q)return;state.lastQ=q;openSearchView();$("#sv_q").value=q;runSearch(q,false,$("#sv_results"));setActive($('.navitem[data-view="search"]'));}
@@ -786,6 +1217,7 @@ $("#globalBtn").addEventListener("click",doGlobalSearch);
 $("#globalQ").addEventListener("keydown",function(e){if(e.key==="Enter")doGlobalSearch();});
 function runSearch(q,exact,target){
   if(!q){target.innerHTML="";return;}
+  state.lastQ=q;state.lastSearchExact=!!exact;
   pushHistory(q);target.innerHTML='<div class="empty">Searching...</div>';
   api("/api/search?q="+encodeURIComponent(q)+(exact?"&exact=1":"")).then(function(d){
     const res=d.results||[];
@@ -797,17 +1229,21 @@ function runSearch(q,exact,target){
       h+='<div class="toolbar" style="margin-top:6px"><span class="title" style="font-size:15px">'+esc(tn)+'</span><span class="meta">'+rows.length+' matches</span><div class="grow"></div><button class="btn sec sm" data-open="'+esc(tn)+'">Open table</button></div>';
       h+='<div class="tablewrap" style="max-height:none"><table class="data"><thead><tr><th>match in</th>';
       const cols=Object.keys(rows[0].row).filter(function(c){return c!=="_rowid";}).slice(0,8);
-      cols.forEach(function(c){h+='<th>'+esc(c)+'</th>';});h+='</tr></thead><tbody>';
+      cols.forEach(function(c){h+='<th>'+esc(c)+'</th>';});h+='<th>Actions</th></tr></thead><tbody>';
       rows.forEach(function(r){
-        h+='<tr data-t="'+esc(tn)+'" data-rid="'+(r.rowid!=null?esc(r.rowid):"")+'"><td><span class="pill">'+esc((r.matchedColumns||[]).join(", "))+'</span></td>';
+        const rid=r.rowid!=null?r.rowid:"";
+        const rec=r.row&&r.row.id!=null?r.row.id:"";
+        h+='<tr data-t="'+esc(tn)+'" data-rid="'+esc(rid)+'" data-rec="'+esc(rec)+'"><td><span class="pill">'+esc((r.matchedColumns||[]).join(", "))+'</span></td>';
         cols.forEach(function(c){h+='<td title="'+esc(r.row[c])+'">'+hi(r.row[c],q)+'</td>';});
+        h+=actionButtons(tn,rid,rec);
         h+='</tr>';
       });
       h+='</tbody></table></div>';
     });
     target.innerHTML=h;
     $$("[data-open]",target).forEach(function(b){b.onclick=function(){openTable(b.dataset.open,true);};});
-    $$("tr[data-rid]",target).forEach(function(tr){tr.onclick=function(){const id=tr.dataset.rid;if(id!=="")inspectRow(tr.dataset.t,id);};});
+    bindActionButtons(target,function(){runSearch(q,exact,target);});
+    $$("tr[data-rid]",target).forEach(function(tr){tr.onclick=function(e){if(e.target.closest(".actions"))return;inspectRow(tr.dataset.t,tr.dataset.rid||null,tr.dataset.rec||null);};});
   });
 }
 
@@ -833,14 +1269,19 @@ function openStats(){state.view="stats";const main=$("#main");main.innerHTML='<d
 }
 
 /* ---- Modal ---- */
-function openModal(title,html){$("#modalTitle").innerHTML=title;$("#modalBody").innerHTML=html;$("#modal").classList.remove("hidden");}
+function openModal(title,html){$("#modalTitle").innerHTML=title;$("#modalBody").innerHTML=html;$("#modal").classList.remove("hidden");if(!inspectCtx.table)$("#modalDeleteBtn").classList.add("hidden");}
 $("#modalClose").onclick=function(){$("#modal").classList.add("hidden");};
 $("#modal").addEventListener("click",function(e){if(e.target===this)this.classList.add("hidden");});
-document.addEventListener("keydown",function(e){if(e.key==="Escape")$("#modal").classList.add("hidden");});
+document.addEventListener("keydown",function(e){
+  if(e.key==="Escape"){
+    if(!$("#deleteModal").classList.contains("hidden"))closeDeleteModal();
+    else $("#modal").classList.add("hidden");
+  }
+});
 
 /* ---- Boot ---- */
 function start(){showApp();loadTables().then(openStats);setActive($('.navitem[data-view="stats"]'));}
-api("/api/session").then(function(d){if(d&&d.authenticated){start();}else{showLogin();}}).catch(showLogin);
+api("/api/session").then(function(d){applySession(d);if(d&&d.authenticated){start();}else{showLogin();}}).catch(showLogin);
 </script>
 </body>
 </html>`;

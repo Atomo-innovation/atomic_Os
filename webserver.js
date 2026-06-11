@@ -70,6 +70,7 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
     obj.parent = parent;
     obj.filespath = parent.filespath;
     obj.db = db;
+    obj.registrationOtp = require('./registrationotp.js').createRegistrationOtp(parent, db);
     obj.app = obj.express();
     if (obj.args.agentport) { obj.agentapp = obj.express(); }
     if (args.compression === true) {
@@ -1430,36 +1431,12 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
                                 res.cookie('twofactor', twoFactorCookie, { maxAge: (maxCookieAge * 24 * 60 * 60 * 1000), httpOnly: true, sameSite: parent.config.settings.sessionsamesite, secure: true });
                             }
 
-                            // Check if email address needs to be confirmed (external Node accounts are already verified, skip this).
-                            const emailcheck = ((domain.mailserver != null) && (obj.parent.certificates.CommonName != null) && (obj.parent.certificates.CommonName.indexOf('.') != -1) && (obj.args.lanonly != true) && (domain.auth != 'sspi') && (domain.auth != 'ldap'))
-                            if (emailcheck && (user.emailVerified !== true) && (user.externalAuth != 'node')) {
-                                parent.debug('web', 'Redirecting using ' + user.name + ' to email check login page');
-                                req.session.messageid = 3; // "Email verification required" message
-                                req.session.loginmode = 7;
-                                req.session.passhint = user.email;
-                                req.session.cuserid = userid;
-                                if (direct === true) { handleRootRequestEx(req, res, domain); } else { res.redirect(domain.url + getQueryPortion(req)); }
-                                return;
-                            }
-
                             // Login successful
                             parent.debug('web', 'handleLoginRequest: successful 2FA login');
                             if (authData != null) { if (loginOptions == null) { loginOptions = {}; } loginOptions.twoFactorType = authData.twoFactorType; }
                             completeLoginRequest(req, res, domain, user, userid, xusername, xpassword, direct, loginOptions);
                         }
                     });
-                    return;
-                }
-
-                // Check if email address needs to be confirmed (external Node accounts are already verified, skip this).
-                const emailcheck = ((domain.mailserver != null) && (obj.parent.certificates.CommonName != null) && (obj.parent.certificates.CommonName.indexOf('.') != -1) && (obj.args.lanonly != true) && (domain.auth != 'sspi') && (domain.auth != 'ldap'))
-                if (emailcheck && (user.emailVerified !== true) && (user.externalAuth != 'node')) {
-                    parent.debug('web', 'Redirecting using ' + user.name + ' to email check login page');
-                    req.session.messageid = 3; // "Email verification required" message
-                    req.session.loginmode = 7;
-                    req.session.passhint = user.email;
-                    req.session.cuserid = userid;
-                    if (direct === true) { handleRootRequestEx(req, res, domain); } else { res.redirect(domain.url + getQueryPortion(req)); }
                     return;
                 }
 
@@ -1601,6 +1578,51 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
         //});
     }
 
+    function finalizeCreateAccount(req, res, domain, direct, accountData) {
+        var domainUserCount = 0;
+        for (var i in obj.users) { if (obj.users[i].domain == domain.id) { domainUserCount++; } }
+
+        var user = { type: 'user', _id: 'user/' + domain.id + '/' + accountData.username.toLowerCase(), name: accountData.username, email: accountData.email, emailVerified: true, creation: Math.floor(Date.now() / 1000), login: Math.floor(Date.now() / 1000), access: Math.floor(Date.now() / 1000), domain: domain.id };
+        if (domain.newaccountsrights) { user.siteadmin = domain.newaccountsrights; }
+        if (obj.common.validateStrArray(domain.newaccountrealms)) { user.groups = domain.newaccountrealms; }
+        if ((domain.passwordrequirements != null) && (domain.passwordrequirements.hint === true) && (accountData.passhint)) { var hint = accountData.passhint; if (hint.length > 250) { hint = hint.substring(0, 250); } user.passhint = hint; }
+        if (domainUserCount == 0) { user.siteadmin = 4294967295; }
+
+        if (typeof domain.newaccountsusergroups == 'object') {
+            for (var i in domain.newaccountsusergroups) {
+                var ugrpid = domain.newaccountsusergroups[i];
+                if (ugrpid.indexOf('/') < 0) { ugrpid = 'ugrp/' + domain.id + '/' + ugrpid; }
+                var ugroup = obj.userGroups[ugrpid];
+                if (ugroup != null) {
+                    if (user.links == null) { user.links = {}; }
+                    user.links[ugroup._id] = { rights: 1 };
+                    ugroup.links[user._id] = { userid: user._id, name: user.name, rights: 1 };
+                    db.Set(ugroup);
+                    var event = { etype: 'ugrp', ugrpid: ugroup._id, name: ugroup.name, desc: ugroup.desc, action: 'usergroupchange', links: ugroup.links, msg: 'Added user ' + user.name + ' to user group ' + ugroup.name, addUserDomain: domain.id };
+                    if (db.changeStream) { event.noact = 1; }
+                    parent.DispatchEvent(['*', ugroup._id, user._id], obj, event);
+                }
+            }
+        }
+
+        obj.users[user._id] = user;
+        require('./pass').hash(accountData.password, function (err, salt, hash, tag) {
+            if (err) throw err;
+            user.salt = salt;
+            user.hash = hash;
+            delete user.passtype;
+            obj.db.SetUser(user);
+        }, 0);
+        var event = { etype: 'user', userid: user._id, username: user.name, account: obj.CloneSafeUser(user), action: 'accountcreate', msg: 'Account created, email is ' + accountData.email, domain: domain.id };
+        if (obj.db.changeStream) { event.noact = 1; }
+        obj.parent.DispatchEvent(['*', 'server-users'], obj, event);
+
+        delete req.session.regotpId;
+        delete req.session.regotpResendAt;
+        if (redirectToNodeAppLoginAfterCreate(req, res, domain)) { return; }
+        if (direct === true) { handleRootRequestEx(req, res, domain); } else { res.redirect(domain.url + getQueryPortion(req)); }
+    }
+
     function handleCreateAccountRequest(req, res, direct) {
         const domain = checkUserIpAddress(req, res);
         if (domain == null) { return; }
@@ -1713,53 +1735,32 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
                                 req.session.loginmode = 2;
                                 req.session.messageid = 104; // Username already exists.
                             } else {
-                                var user = { type: 'user', _id: 'user/' + domain.id + '/' + req.body.username.toLowerCase(), name: req.body.username, email: req.body.email, creation: Math.floor(Date.now() / 1000), login: Math.floor(Date.now() / 1000), access: Math.floor(Date.now() / 1000), domain: domain.id };
-                                if (domain.newaccountsrights) { user.siteadmin = domain.newaccountsrights; }
-                                if (obj.common.validateStrArray(domain.newaccountrealms)) { user.groups = domain.newaccountrealms; }
-                                if ((domain.passwordrequirements != null) && (domain.passwordrequirements.hint === true) && (req.body.apasswordhint)) { var hint = req.body.apasswordhint; if (hint.length > 250) { hint = hint.substring(0, 250); } user.passhint = hint; }
-                                if (domainUserCount == 0) { user.siteadmin = 4294967295; /*if (domain.newaccounts === 2) { delete domain.newaccounts; }*/ } // If this is the first user, give the account site admin.
-
-                                // Auto-join any user groups
-                                if (typeof domain.newaccountsusergroups == 'object') {
-                                    for (var i in domain.newaccountsusergroups) {
-                                        var ugrpid = domain.newaccountsusergroups[i];
-                                        if (ugrpid.indexOf('/') < 0) { ugrpid = 'ugrp/' + domain.id + '/' + ugrpid; }
-                                        var ugroup = obj.userGroups[ugrpid];
-                                        if (ugroup != null) {
-                                            // Add group to the user
-                                            if (user.links == null) { user.links = {}; }
-                                            user.links[ugroup._id] = { rights: 1 };
-
-                                            // Add user to the group
-                                            ugroup.links[user._id] = { userid: user._id, name: user.name, rights: 1 };
-                                            db.Set(ugroup);
-
-                                            // Notify user group change
-                                            var event = { etype: 'ugrp', ugrpid: ugroup._id, name: ugroup.name, desc: ugroup.desc, action: 'usergroupchange', links: ugroup.links, msg: 'Added user ' + user.name + ' to user group ' + ugroup.name, addUserDomain: domain.id };
-                                            if (db.changeStream) { event.noact = 1; } // If DB change stream is active, don't use this event to change the user group. Another event will come.
-                                            parent.DispatchEvent(['*', ugroup._id, user._id], obj, event);
+                                var pendingData = {
+                                    username: req.body.username,
+                                    email: req.body.email,
+                                    password: req.body.password1,
+                                    passhint: (req.body.apasswordhint || '')
+                                };
+                                obj.registrationOtp.createAndSend(domain, req.body.email, pendingData, cleanRemoteAddr(req.clientIp), function (otpErr, otpId, maskedEmail) {
+                                    if (otpErr) {
+                                        parent.debug('web', 'handleCreateAccountRequest: OTP send failed (' + otpErr + ')');
+                                        req.session.loginmode = 2;
+                                        if (otpErr === 'rate_limit') {
+                                            req.session.messageid = 121;
+                                        } else {
+                                            req.session.messageid = 122;
                                         }
+                                        if (direct === true) { handleRootRequestEx(req, res, domain); } else { res.redirect(domain.url + getQueryPortion(req)); }
+                                        return;
                                     }
-                                }
-
-                                obj.users[user._id] = user;
-                                // Store account in DB only — do not log in or open the MeshCentral dashboard.
-                                require('./pass').hash(req.body.password1, function (err, salt, hash, tag) {
-                                    if (err) throw err;
-                                    user.salt = salt;
-                                    user.hash = hash;
-                                    delete user.passtype;
-                                    obj.db.SetUser(user);
-
-                                    // Send the verification email
-                                    if ((domain.mailserver != null) && (domain.auth != 'sspi') && (domain.auth != 'ldap') && (obj.common.validateEmail(user.email, 1, 256) == true)) { domain.mailserver.sendAccountCheckMail(domain, user.name, user._id, user.email, obj.getLanguageCodes(req), req.query.key); }
-                                }, 0);
-                                var event = { etype: 'user', userid: user._id, username: user.name, account: obj.CloneSafeUser(user), action: 'accountcreate', msg: 'Account created, email is ' + req.body.email, domain: domain.id };
-                                if (obj.db.changeStream) { event.noact = 1; } // If DB change stream is active, don't use this event to create the user. Another event will come.
-                                obj.parent.DispatchEvent(['*', 'server-users'], obj, event);
-
-                                // Saved in DB only — redirect to Node login (not MeshCentral dashboard).
-                                if (redirectToNodeAppLoginAfterCreate(req, res, domain)) { return; }
+                                    req.session.regotpId = otpId;
+                                    req.session.regotpResendAt = Date.now() + obj.registrationOtp.RESEND_COOLDOWN_MS;
+                                    req.session.loginmode = 9;
+                                    req.session.messageid = 8;
+                                    req.session.passhint = maskedEmail;
+                                    if (direct === true) { handleRootRequestEx(req, res, domain); } else { res.redirect(domain.url + getQueryPortion(req)); }
+                                });
+                                return;
                             }
 
                             if (direct === true) { handleRootRequestEx(req, res, domain); } else { res.redirect(domain.url + getQueryPortion(req)); }
@@ -1767,6 +1768,105 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
                     });
                 }
             }
+        });
+    }
+
+    function handleVerifyCreateOtpRequest(req, res, direct) {
+        const domain = checkUserIpAddress(req, res);
+        if (domain == null) { return; }
+        if ((domain.auth == 'sspi') || (domain.auth == 'ldap')) { res.sendStatus(404); return; }
+        if ((domain.loginkey != null) && (domain.loginkey.indexOf(req.query.key) == -1)) { res.sendStatus(404); return; }
+        if (req.session.loginToken != null) { res.sendStatus(404); return; }
+        if (req.body == null) { res.sendStatus(404); return; }
+        if (typeof req.session.regotpId != 'string') {
+            req.session.loginmode = 2;
+            req.session.messageid = 118;
+            if (direct === true) { handleRootRequestEx(req, res, domain); } else { res.redirect(domain.url + getQueryPortion(req)); }
+            return;
+        }
+
+        var otpInput = (typeof req.body.regotp == 'string') ? req.body.regotp.trim() : '';
+        obj.registrationOtp.verify(req.session.regotpId, otpInput, domain, function (verifyErr, pending) {
+            if (verifyErr) {
+                req.session.loginmode = 9;
+                req.session.passhint = req.session.passhint || '';
+                if (verifyErr === 'expired') {
+                    req.session.messageid = 119;
+                    delete req.session.regotpId;
+                    delete req.session.regotpResendAt;
+                } else if (verifyErr === 'max_attempts') {
+                    req.session.messageid = 120;
+                    delete req.session.regotpId;
+                    delete req.session.regotpResendAt;
+                } else if (verifyErr === 'invalid_format' || verifyErr === 'invalid') {
+                    req.session.messageid = 118;
+                } else {
+                    req.session.messageid = 118;
+                    delete req.session.regotpId;
+                    delete req.session.regotpResendAt;
+                }
+                if (direct === true) { handleRootRequestEx(req, res, domain); } else { res.redirect(domain.url + getQueryPortion(req)); }
+                return;
+            }
+
+            if (obj.users['user/' + domain.id + '/' + pending.username.toLowerCase()]) {
+                req.session.loginmode = 2;
+                req.session.messageid = 104;
+                delete req.session.regotpId;
+                delete req.session.regotpResendAt;
+                if (direct === true) { handleRootRequestEx(req, res, domain); } else { res.redirect(domain.url + getQueryPortion(req)); }
+                return;
+            }
+
+            obj.db.GetUserWithVerifiedEmail(domain.id, pending.email, function (err, docs) {
+                if ((docs != null) && (docs.length > 0)) {
+                    req.session.loginmode = 2;
+                    req.session.messageid = 102;
+                    delete req.session.regotpId;
+                    delete req.session.regotpResendAt;
+                    if (direct === true) { handleRootRequestEx(req, res, domain); } else { res.redirect(domain.url + getQueryPortion(req)); }
+                    return;
+                }
+                req.session.loginmode = 1;
+                req.session.messageid = 7;
+                finalizeCreateAccount(req, res, domain, direct, pending);
+            });
+        });
+    }
+
+    function handleResendCreateOtpRequest(req, res, direct) {
+        const domain = checkUserIpAddress(req, res);
+        if (domain == null) { return; }
+        if ((domain.auth == 'sspi') || (domain.auth == 'ldap')) { res.sendStatus(404); return; }
+        if ((domain.loginkey != null) && (domain.loginkey.indexOf(req.query.key) == -1)) { res.sendStatus(404); return; }
+        if (req.session.loginToken != null) { res.sendStatus(404); return; }
+        if (typeof req.session.regotpId != 'string') {
+            req.session.loginmode = 2;
+            req.session.messageid = 118;
+            if (direct === true) { handleRootRequestEx(req, res, domain); } else { res.redirect(domain.url + getQueryPortion(req)); }
+            return;
+        }
+
+        obj.registrationOtp.resend(req.session.regotpId, domain, cleanRemoteAddr(req.clientIp), function (resendErr, cooldownSeconds) {
+            req.session.loginmode = 9;
+            if (resendErr) {
+                if (resendErr === 'cooldown') {
+                    req.session.messageid = 121;
+                    req.session.regotpResendAt = Date.now() + ((cooldownSeconds || 60) * 1000);
+                } else if (resendErr === 'expired') {
+                    req.session.messageid = 119;
+                    delete req.session.regotpId;
+                    delete req.session.regotpResendAt;
+                } else if (resendErr === 'rate_limit') {
+                    req.session.messageid = 121;
+                } else {
+                    req.session.messageid = 122;
+                }
+            } else {
+                req.session.messageid = 8;
+                req.session.regotpResendAt = Date.now() + obj.registrationOtp.RESEND_COOLDOWN_MS;
+            }
+            if (direct === true) { handleRootRequestEx(req, res, domain); } else { res.redirect(domain.url + getQueryPortion(req)); }
         });
     }
 
@@ -2029,6 +2129,9 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
 
     // Handle account email change and email verification request
     function handleCheckAccountEmailRequest(req, res, direct) {
+        // Link-based email confirmation disabled — registration OTP verifies email once.
+        res.sendStatus(404);
+        return;
         const domain = checkUserIpAddress(req, res);
         if (domain == null) { return; }
         if ((domain.mailserver == null) || (domain.auth == 'sspi') || (domain.auth == 'ldap') || (typeof req.session.cuserid != 'string') || (obj.users[req.session.cuserid] == null) || (!obj.common.validateEmail(req.body.email, 1, 256))) { parent.debug('web', 'handleCheckAccountEmailRequest: failed checks.'); res.sendStatus(404); return; }
@@ -2585,6 +2688,22 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
             }
         });
     }
+
+    // Remove a user from server memory and disconnect all active sessions.
+    // Used when a user row is deleted directly in the database (e.g. dbconsole).
+    obj.purgeUserAccount = function (userid) {
+        if (typeof userid !== 'string' || userid.indexOf('user/') !== 0) { return false; }
+        var deluser = obj.users[userid];
+        var domainId = userid.split('/')[1];
+        var username = (deluser != null) ? deluser.name : userid.split('/')[2];
+        delete obj.users[userid];
+        obj.parent.DispatchEvent([userid], obj, 'close');
+        var targets = ['*', 'server-users'];
+        if (deluser != null && deluser.groups) { for (var i in deluser.groups) { targets.push('server-users:' + i); } }
+        obj.parent.DispatchEvent(targets, obj, { etype: 'user', userid: userid, username: username, action: 'accountremove', msg: 'Account removed', domain: domainId, nolog: 1 });
+        parent.debug('web', 'purgeUserAccount: removed user ' + userid);
+        return true;
+    };
 
     // Check a user's password
     obj.checkUserPassword = function (domain, user, password, func) {
@@ -3511,12 +3630,15 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
         if (req.session) { loginmode = req.session.loginmode; delete req.session.loginmode; } // Clear this state, if the user hits refresh, we want to go back to the login page.
 
         // Format an error message if needed
-        var passhint = null, msgid = 0;
+        var passhint = null, msgid = 0, regotpResendSeconds = 0;
         if (req.session != null) {
             msgid = req.session.messageid;
-            if ((msgid == 5) || (loginmode == 7) || ((domain.passwordrequirements != null) && (domain.passwordrequirements.hint === true))) { passhint = EscapeHtml(req.session.passhint); }
+            if ((msgid == 5) || (loginmode == 7) || (loginmode == 9) || ((domain.passwordrequirements != null) && (domain.passwordrequirements.hint === true))) { passhint = EscapeHtml(req.session.passhint); }
+            if (loginmode == 9 && (typeof req.session.regotpResendAt == 'number')) {
+                regotpResendSeconds = Math.max(0, Math.ceil((req.session.regotpResendAt - Date.now()) / 1000));
+            }
             delete req.session.messageid;
-            delete req.session.passhint;
+            if (loginmode != 9) { delete req.session.passhint; }
         }
         const allowAccountReset = ((typeof domain.passwordrequirements != 'object') || (domain.passwordrequirements.allowaccountreset !== false));
         const emailcheck = (allowAccountReset && (domain.mailserver != null) && (obj.parent.certificates.CommonName != null) && (obj.parent.certificates.CommonName.indexOf('.') != -1) && (obj.args.lanonly != true) && (domain.auth != 'sspi') && (domain.auth != 'ldap'))
@@ -3663,6 +3785,7 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
                 messageid: msgid,
                 flashErrors: JSON.stringify(flashErrors).replace(/"/g, '\\"'),
                 passhint: passhint,
+                regotpResendSeconds: regotpResendSeconds,
                 
                 welcometext: domain.welcometext ? encodeURIComponent(obj.common.replacePlaceholders(domain.welcometext, { 
                     'serverversion': obj.parent.currentVer,
@@ -3743,6 +3866,8 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
             case 'changepassword': { handlePasswordChangeRequest(req, res, true); break; }
             case 'deleteaccount': { handleDeleteAccountRequest(req, res, true); break; }
             case 'createaccount': { handleCreateAccountRequest(req, res, true); break; }
+            case 'verifycreateotp': { handleVerifyCreateOtpRequest(req, res, true); break; }
+            case 'resendcreateotp': { handleResendCreateOtpRequest(req, res, true); break; }
             case 'resetpassword': { handleResetPasswordRequest(req, res, true); break; }
             case 'resetaccount': { handleResetAccountRequest(req, res, true); break; }
             case 'checkemail': { handleCheckAccountEmailRequest(req, res, true); break; }
@@ -6816,9 +6941,16 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
 
         // Add HTTP security headers to all responses
         obj.app.use(async function (req, res, next) {
-            // Check if a session is destroyed
+            // Check if a session is destroyed or the user account no longer exists
             if (typeof req.session.userid == 'string') {
-                if (typeof req.session.x == 'string') {
+                if (obj.users[req.session.userid] == null) {
+                    delete req.session.userid;
+                    delete req.session.ip;
+                    delete req.session.t;
+                    delete req.session.x;
+                    delete req.session.loginmode;
+                    delete req.session.currentNode;
+                } else if (typeof req.session.x == 'string') {
                     if (obj.destroyedSessions[req.session.userid + '/' + req.session.x] != null) {
                         delete req.session.userid;
                         delete req.session.ip;
@@ -7112,6 +7244,8 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
                 obj.app.post(url + 'changepassword', obj.bodyParser.urlencoded({ extended: false }), handlePasswordChangeRequest);
                 obj.app.post(url + 'deleteaccount', obj.bodyParser.urlencoded({ extended: false }), handleDeleteAccountRequest);
                 obj.app.post(url + 'createaccount', obj.bodyParser.urlencoded({ extended: false }), handleCreateAccountRequest);
+                obj.app.post(url + 'verifycreateotp', obj.bodyParser.urlencoded({ extended: false }), handleVerifyCreateOtpRequest);
+                obj.app.post(url + 'resendcreateotp', obj.bodyParser.urlencoded({ extended: false }), handleResendCreateOtpRequest);
                 obj.app.post(url + 'resetpassword', obj.bodyParser.urlencoded({ extended: false }), handleResetPasswordRequest);
                 obj.app.post(url + 'resetaccount', obj.bodyParser.urlencoded({ extended: false }), handleResetAccountRequest);
                 obj.app.get(url + 'checkmail', handleCheckMailRequest);
@@ -8657,33 +8791,16 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
                                                     try { ws.send(JSON.stringify({ action: 'close', cause: 'noauth', msg: 'tokenrequired', email2fa: email2fa, sms2fa: sms2fa, msg2fa: msg2fa, twoFactorCookieDays: twoFactorCookieDays })); ws.close(); } catch (e) { }
                                                 } else {
                                                     // We are authenticated with 2nd factor.
-                                                    // Check email verification
-                                                    if (emailcheck && (user.email != null) && (!(user._id.split('/')[2].startsWith('~'))) && (user.emailVerified !== true)) {
-                                                        parent.debug('web', 'Invalid login, asking for email validation');
-                                                        try { ws.send(JSON.stringify({ action: 'close', cause: 'emailvalidation', msg: 'emailvalidationrequired', email2fa: email2fa, sms2fa: sms2fa, msg2fa: msg2fa, email2fasent: true })); ws.close(); } catch (e) { }
-                                                    } else {
-                                                        // We are authenticated
-                                                        ws._socket.pause();
-                                                        ws.removeAllListeners(['message', 'close', 'error']);
-                                                        func(ws, req, domain, user, authData);
-                                                    }
+                                                    ws._socket.pause();
+                                                    ws.removeAllListeners(['message', 'close', 'error']);
+                                                    func(ws, req, domain, user, authData);
                                                 }
                                             });
                                         }
                                     } else {
-                                        // Check email verification
-                                        if (emailcheck && (user.email != null) && (!(user._id.split('/')[2].startsWith('~'))) && (user.emailVerified !== true)) {
-                                            parent.debug('web', 'Invalid login, asking for email validation');
-                                            var email2fa = (((typeof domain.passwordrequirements != 'object') || (domain.passwordrequirements.email2factor != false)) && (domain.mailserver != null) && (user.otpekey != null));
-                                            var sms2fa = (((typeof domain.passwordrequirements != 'object') || (domain.passwordrequirements.sms2factor != false)) && (parent.smsserver != null) && (user.phone != null));
-                                            var msg2fa = (((typeof domain.passwordrequirements != 'object') || (domain.passwordrequirements.msg2factor != false)) && (parent.msgserver != null) && (parent.msgserver.providers != 0) && (user.msghandle != null));
-                                            try { ws.send(JSON.stringify({ action: 'close', cause: 'emailvalidation', msg: 'emailvalidationrequired', email2fa: email2fa, sms2fa: sms2fa, msg2fa: msg2fa, email2fasent: true })); ws.close(); } catch (e) { }
-                                        } else {
-                                            // We are authenticated
-                                            ws._socket.pause();
-                                            ws.removeAllListeners(['message', 'close', 'error']);
-                                            func(ws, req, domain, user, twoFactorSkip);
-                                        }
+                                        ws._socket.pause();
+                                        ws.removeAllListeners(['message', 'close', 'error']);
+                                        func(ws, req, domain, user, twoFactorSkip);
                                     }
                                 }
                             }
@@ -8812,35 +8929,18 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
                                         parent.debug('web', 'Invalid login token, asking again');
                                         try { ws.send(JSON.stringify({ action: 'close', cause: 'noauth', msg: 'tokenrequired', email2fa: email2fa, sms2fa: sms2fa, msg2fa: msg2fa, twoFactorCookieDays: twoFactorCookieDays })); ws.close(); } catch (e) { }
                                     } else {
-                                        // We are authenticated with 2nd factor.
-                                        // Check email verification
-                                        if (emailcheck && (user.email != null) && (!(user._id.split('/')[2].startsWith('~'))) && (user.emailVerified !== true)) {
-                                            parent.debug('web', 'Invalid login, asking for email validation');
-                                            try { ws.send(JSON.stringify({ action: 'close', cause: 'emailvalidation', msg: 'emailvalidationrequired', email2fa: email2fa, sms2fa: sms2fa, msg2fa: msg2fa, email2fasent: true })); ws.close(); } catch (e) { }
-                                        } else {
-                                            req.session.userid = user._id;
-                                            req.session.ip = req.clientIp;
-                                            setSessionRandom(req);
-                                            func(ws, req, domain, user, null, authData);
-                                        }
+                                        req.session.userid = user._id;
+                                        req.session.ip = req.clientIp;
+                                        setSessionRandom(req);
+                                        func(ws, req, domain, user, null, authData);
                                     }
                                 });
                             }
                         } else {
-                            // Check email verification
-                            if (emailcheck && (user.email != null) && (!(user._id.split('/')[2].startsWith('~'))) && (user.emailVerified !== true)) {
-                                parent.debug('web', 'Invalid login, asking for email validation');
-                                var email2fa = (((typeof domain.passwordrequirements != 'object') || (domain.passwordrequirements.email2factor != false)) && (domain.mailserver != null) && (user.otpekey != null));
-                                var sms2fa = (((typeof domain.passwordrequirements != 'object') || (domain.passwordrequirements.sms2factor != false)) && (parent.smsserver != null) && (user.phone != null));
-                                var msg2fa = (((typeof domain.passwordrequirements != 'object') || (domain.passwordrequirements.msg2factor != false)) && (parent.msgserver != null) && (parent.msgserver.providers != 0) && (user.msghandle != null));
-                                try { ws.send(JSON.stringify({ action: 'close', cause: 'emailvalidation', msg: 'emailvalidationrequired', email2fa: email2fa, sms2fa: sms2fa, msg2fa: msg2fa, email2fasent: true })); ws.close(); } catch (e) { }
-                            } else {
-                                // We are authenticated
-                                req.session.userid = user._id;
-                                req.session.ip = req.clientIp;
-                                setSessionRandom(req);
-                                func(ws, req, domain, user);
-                            }
+                            req.session.userid = user._id;
+                            req.session.ip = req.clientIp;
+                            setSessionRandom(req);
+                            func(ws, req, domain, user);
                         }
                     } else {
                         // Failed to authenticate, see if a default user is active
@@ -8950,29 +9050,15 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
                                             try { ws.send(JSON.stringify({ action: 'close', cause: 'noauth', msg: 'tokenrequired', email2fa: email2fa, sms2fa: sms2fa, msg2fa: msg2fa, twoFactorCookieDays: twoFactorCookieDays })); ws.close(); } catch (e) { }
                                         }
                                     } else {
-                                        // We are authenticated with 2nd factor.
-                                        // Check email verification
-                                        if (emailcheck && (user.email != null) && (!(user._id.split('/')[2].startsWith('~'))) && (user.emailVerified !== true)) {
-                                            parent.debug('web', 'Invalid login, asking for email validation');
-                                            try { ws.send(JSON.stringify({ action: 'close', cause: 'emailvalidation', msg: 'emailvalidationrequired', email2fa: email2fa, email2fasent: true, twoFactorCookieDays: twoFactorCookieDays })); ws.close(); } catch (e) { }
-                                        } else {
-                                            func(ws, req, domain, user, null, authData);
-                                        }
+                                        func(ws, req, domain, user, null, authData);
                                     }
                                 });
                             }
                         } else {
-                            // We are authenticated
-                            // Check email verification
-                            if (emailcheck && (user.email != null) && (!(user._id.split('/')[2].startsWith('~'))) && (user.emailVerified !== true)) {
-                                parent.debug('web', 'Invalid login, asking for email validation');
-                                try { ws.send(JSON.stringify({ action: 'close', cause: 'emailvalidation', msg: 'emailvalidationrequired', email2fa: email2fa, email2fasent: true })); ws.close(); } catch (e) { }
-                            } else {                                
-                                req.session.userid = user._id;
-                                req.session.ip = req.clientIp;
-                                setSessionRandom(req);
-                                func(ws, req, domain, user);
-                            }
+                            req.session.userid = user._id;
+                            req.session.ip = req.clientIp;
+                            setSessionRandom(req);
+                            func(ws, req, domain, user);
                         }
                     } else {
                         // Failed to authenticate, see if a default user is active

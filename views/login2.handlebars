@@ -327,6 +327,38 @@
                         <input id=checkemailformargs name="urlargs" type="hidden" value="" />
                     </form>
                 </div>
+                <div id=createotppanel style="display:none;position:relative">
+                    <form id=createotppanelform method=post>
+                        <input type=hidden name=action value=verifycreateotp />
+                        <div id=message9></div>
+                        <div>
+                            <b>Email Verification</b>
+                        </div>
+                        <p id=regotpEmailHint style="margin-top:8px;margin-bottom:8px"></p>
+                        <table style="width:100%">
+                            <tr>
+                                <td>
+                                    <input id=regotpInput {{{autocomplete}}}="one-time-code" title="Verification Code" style="box-sizing:border-box;width:280px;border:0;border-radius:4px;padding:8px;background-color:#FFF8CC" placeholder="8-digit verification code" inputmode="numeric" pattern="[0-9]*" type=text maxlength=8 name=regotp oninput=validateRegOtp(event) onpaste=validateRegOtp(event) onkeydown=validateRegOtp(event) />
+                                </td>
+                            </tr>
+                            <tr>
+                                <td>
+                                    <div style="margin-top:8px">
+                                        <input id=regotpVerifyButton style="box-sizing:border-box;width:280px;border:0;border-radius:4px;padding:6px" type="button" onclick="submitButtonClicked('createotppanelform')" value="Verify" disabled="disabled" />
+                                    </div>
+                                </td>
+                            </tr>
+                            <tr>
+                                <td style="padding-top:10px">
+                                    <input id=regotpResendButton type=button value="Resend OTP" onclick="resendRegOtp()" disabled="disabled" />
+                                    <span id=regotpResendTimer style="margin-left:8px"></span>
+                                </td>
+                            </tr>
+                        </table>
+                        <hr /><a onclick="return xgo(1,event);" href="#" style=cursor:pointer>Back to login</a>
+                        <input id=createotpformargs name="urlargs" type="hidden" value="" />
+                    </form>
+                </div>
                 <div id=waitpushpanel style="display:none">
                     <form id=waitpushpanelform method=post>
                         <input type=hidden name=action value=pushlogin />
@@ -411,6 +443,8 @@
         var tokenTimeout = parseInt('{{{tokenTimeout}}}');
         var websocket = null;
         var formSubmitted = false;
+        var regotpResendSeconds = parseInt('{{{regotpResendSeconds}}}') || 0;
+        var regotpCountdownTimer = null;
         var serverLangs = '{{{renderLanguages}}}'.split(',');
         var loclist = { 'af': "Afrikaans", 'sq': "Albanian", 'ar': "Arabic (Standard)", 'ar-dz': "Arabic (Algeria)", 'ar-bh': "Arabic (Bahrain)", 'ar-eg': "Arabic (Egypt)", 'ar-iq': "Arabic (Iraq)", 'ar-jo': "Arabic (Jordan)", 'ar-kw': "Arabic (Kuwait)", 'ar-lb': "Arabic (Lebanon)", 'ar-ly': "Arabic (Libya)", 'ar-ma': "Arabic (Morocco)", 'ar-om': "Arabic (Oman)", 'ar-qa': "Arabic (Qatar)", 'ar-sa': "Arabic (Saudi Arabia)", 'ar-sy': "Arabic (Syria)", 'ar-tn': "Arabic (Tunisia)", 'ar-ae': "Arabic (U.A.E.)", 'ar-ye': "Arabic (Yemen)", 'an': "Aragonese", 'hy': "Armenian", 'as': "Assamese", 'ast': "Asturian", 'az': "Azerbaijani", 'eu': "Basque", 'bg': "Bulgarian", 'be': "Belarusian", 'bn': "Bengali", 'bs': "Bosnian", 'br': "Breton", 'my': "Burmese", 'ca': "Catalan", 'ch': "Chamorro", 'ce': "Chechen", 'zh': "Chinese", 'zh-hk': "Chinese (Hong Kong)", 'zh-cn': "Chinese (PRC)", 'zh-sg': "Chinese (Singapore)", 'zh-tw': "Chinese (Taiwan)", 'cv': "Chuvash", 'co': "Corsican", 'cr': "Cree", 'hr': "Croatian", 'cs': "Czech", 'da': "Danish", 'nl': "Dutch (Standard)", 'nl-be': "Dutch (Belgian)", 'en': "English", 'en-au': "English (Australia)", 'en-bz': "English (Belize)", 'en-ca': "English (Canada)", 'en-ie': "English (Ireland)", 'en-jm': "English (Jamaica)", 'en-nz': "English (New Zealand)", 'en-ph': "English (Philippines)", 'en-za': "English (South Africa)", 'en-tt': "English (Trinidad & Tobago)", 'en-gb': "English (United Kingdom)", 'en-us': "English (United States)", 'en-zw': "English (Zimbabwe)", 'eo': "Esperanto", 'et': "Estonian", 'fo': "Faeroese", 'fa': "Farsi (Persian)", 'fj': "Fijian", 'fi': "Finnish", 'fr': "French (Standard)", 'fr-be': "French (Belgium)", 'fr-ca': "French (Canada)", 'fr-fr': "French (France)", 'fr-lu': "French (Luxembourg)", 'fr-mc': "French (Monaco)", 'fr-ch': "French (Switzerland)", 'fy': "Frisian", 'fur': "Friulian", 'gd': "Gaelic (Scots)", 'gd-ie': "Gaelic (Irish)", 'gl': "Galacian", 'ka': "Georgian", 'de': "German (Standard)", 'de-at': "German (Austria)", 'de-de': "German (Germany)", 'de-li': "German (Liechtenstein)", 'de-lu': "German (Luxembourg)", 'de-ch': "German (Switzerland)", 'el': "Greek", 'gu': "Gujurati", 'ht': "Haitian", 'he': "Hebrew", 'hi': "Hindi", 'hu': "Hungarian", 'is': "Icelandic", 'id': "Indonesian", 'iu': "Inuktitut", 'ga': "Irish", 'it': "Italian (Standard)", 'it-ch': "Italian (Switzerland)", 'ja': "Japanese", 'kn': "Kannada", 'ks': "Kashmiri", 'kk': "Kazakh", 'km': "Khmer", 'ky': "Kirghiz", 'tlh': "Klingon", 'ko': "Korean", 'ko-kp': "Korean (North Korea)", 'ko-kr': "Korean (South Korea)", 'la': "Latin", 'lv': "Latvian", 'lt': "Lithuanian", 'lb': "Luxembourgish", 'mk': "FYRO Macedonian", 'ms': "Malay", 'ml': "Malayalam", 'mt': "Maltese", 'mi': "Maori", 'mr': "Marathi", 'mo': "Moldavian", 'nv': "Navajo", 'ng': "Ndonga", 'ne': "Nepali", 'no': "Norwegian", 'nb': "Norwegian (Bokmal)", 'nn': "Norwegian (Nynorsk)", 'oc': "Occitan", 'or': "Oriya", 'om': "Oromo", 'fa-ir': "Persian/Iran", 'pl': "Polish", 'pt': "Portuguese", 'pt-br': "Portuguese (Brazil)", 'pa': "Punjabi", 'pa-in': "Punjabi (India)", 'pa-pk': "Punjabi (Pakistan)", 'qu': "Quechua", 'rm': "Rhaeto-Romanic", 'ro': "Romanian", 'ro-mo': "Romanian (Moldavia)", 'ru': "Russian", 'ru-mo': "Russian (Moldavia)", 'sz': "Sami (Lappish)", 'sg': "Sango", 'sa': "Sanskrit", 'sc': "Sardinian", 'sd': "Sindhi", 'si': "Singhalese", 'sr': "Serbian", 'sk': "Slovak", 'sl': "Slovenian", 'so': "Somani", 'sb': "Sorbian", 'es': "Spanish", 'es-ar': "Spanish (Argentina)", 'es-bo': "Spanish (Bolivia)", 'es-cl': "Spanish (Chile)", 'es-co': "Spanish (Colombia)", 'es-cr': "Spanish (Costa Rica)", 'es-do': "Spanish (Dominican Republic)", 'es-ec': "Spanish (Ecuador)", 'es-sv': "Spanish (El Salvador)", 'es-gt': "Spanish (Guatemala)", 'es-hn': "Spanish (Honduras)", 'es-mx': "Spanish (Mexico)", 'es-ni': "Spanish (Nicaragua)", 'es-pa': "Spanish (Panama)", 'es-py': "Spanish (Paraguay)", 'es-pe': "Spanish (Peru)", 'es-pr': "Spanish (Puerto Rico)", 'es-es': "Spanish (Spain)", 'es-uy': "Spanish (Uruguay)", 'es-ve': "Spanish (Venezuela)", 'sx': "Sutu", 'sw': "Swahili", 'sv': "Swedish", 'sv-fi': "Swedish (Finland)", 'sv-sv': "Swedish (Sweden)", 'ta': "Tamil", 'tt': "Tatar", 'te': "Teluga", 'th': "Thai", 'tig': "Tigre", 'ts': "Tsonga", 'tn': "Tswana", 'tr': "Turkish", 'tk': "Turkmen", 'uk': "Ukrainian", 'hsb': "Upper Sorbian", 'ur': "Urdu", 've': "Venda", 'vi': "Vietnamese", 'vo': "Volapuk", 'wa': "Walloon", 'cy': "Welsh", 'xh': "Xhosa", 'ji': "Yiddish", 'zu': "Zulu" };
         var loclistex = { 'zh-chs': "Chinese (Simplified)", 'zh-cht': "Chinese (Traditional)" };
@@ -433,15 +467,15 @@
             // Display the right server message
             var i;
             var messageid = parseInt('{{{messageid}}}');
-            var okmessages = ['', "If valid, reset mail sent.", "Email sent.", "Email verification required, check your mailbox and click the confirmation link.", "SMS sent.", "Sending notification...", "Message sent.", "Account created successfully. Your details are saved — log in when you are ready."];
-            var failmessages = ["Unable to create account.", "Account limit reached.", "Existing account with this email address.", "Invalid account creation token.", "Username already exists.", "Password rejected, use a different one.", "Invalid email.", "Account not found.", "Invalid token, try again.", "Unable to sent email.", "Account locked.", "Access denied.", "Login failed, check username and password.", "Password change requested.", "IP address blocked, try again later.", "Server under maintenance.", "Unable to send device notification.", "Invalid security check."];
+            var okmessages = ['', "If valid, reset mail sent.", "Email sent.", "Email verification required, check your mailbox and click the confirmation link.", "SMS sent.", "Sending notification...", "Message sent.", "Account created successfully. Your details are saved — log in when you are ready.", "Verification code sent to your email. Enter the 8-digit code below."];
+            var failmessages = ["Unable to create account.", "Account limit reached.", "Existing account with this email address.", "Invalid account creation token.", "Username already exists.", "Password rejected, use a different one.", "Invalid email.", "Account not found.", "Invalid token, try again.", "Unable to sent email.", "Account locked.", "Access denied.", "Login failed, check username and password.", "Password change requested.", "IP address blocked, try again later.", "Server under maintenance.", "Unable to send device notification.", "Invalid security check.", "Invalid verification code.", "Verification code expired. Please start account creation again.", "Too many failed attempts. Please start account creation again.", "Please wait before requesting another code.", "Unable to send verification email."];
             if (messageid > 0) {
                 var msg = '';
                 if ((messageid < 100) && (messageid < okmessages.length)) { msg = okmessages[messageid]; }
                 else if ((messageid >= 100) && ((messageid - 100) < failmessages.length)) { msg = failmessages[messageid - 100]; }
                 if (msg != '') {
                     if (messageid >= 100) { msg = ('<span class="msg error"><b style=color:#8C001A>' + msg + '<b></span><br /><br />'); } else { msg = ('<span class="msg success"><b>' + msg + '</b></span><br /><br />'); }
-                    for (i = 1; i < 9; i++) { QH('message' + i, msg); }
+                    for (i = 1; i < 10; i++) { QH('message' + i, msg); }
                 }
             }
 
@@ -513,6 +547,7 @@
                 Q('resettokenformargs').value = xurlargs;
                 Q('resetpasswordformargs').value = xurlargs;
                 Q('checkemailformargs').value = xurlargs;
+                Q('createotpformargs').value = xurlargs;
             }
 
             if ((features & 32) == 0) {
@@ -780,6 +815,7 @@
             QV('message5', false);
             QV('message6', false);
             QV('message7', false);
+            QV('message9', false);
             go(x);
             haltEvent(e);
             return false;
@@ -797,6 +833,7 @@
             QV('resetpasswordpanel', x == 6);
             QV('checkemailpanel', x == 7);
             QV('waitpushpanel', x == 8);
+            QV('createotppanel', x == 9);
             if (x == 1) { Q('username').focus(); }
             if (x == 2) { if (features & 0x200000) { Q('aemail').focus(); } else { Q('ausername').focus(); } } // Email is username
             if (x == 3) { Q('remail').focus(); }
@@ -808,6 +845,75 @@
                 QV('checkCheckOperations', Q('unconfirmedEmail').innerHTML != '');
                 QH('checkEmailVal', passhint);
             }
+            if (x == 9) {
+                formSubmitted = false;
+                QH('regotpEmailHint', passhint ? ('A verification code was sent to <b>' + passhint + '</b>.') : 'A verification code was sent to your email.');
+                Q('regotpInput').value = '';
+                QE('regotpVerifyButton', false);
+                startRegOtpCountdown(regotpResendSeconds);
+                setTimeout(function () { Q('regotpInput').focus(); }, 100);
+            } else {
+                stopRegOtpCountdown();
+            }
+        }
+
+        function validateRegOtp(e) {
+            var v = Q('regotpInput').value.replace(/\D/g, '').substring(0, 8);
+            if (Q('regotpInput').value != v) { Q('regotpInput').value = v; }
+            var ok = (v.length == 8);
+            QE('regotpVerifyButton', ok);
+            if ((e != null) && (e.type == 'keydown') && (e.keyCode == 13) && ok) {
+                haltEvent(e);
+                Q('regotpVerifyButton').click();
+            }
+        }
+
+        function stopRegOtpCountdown() {
+            if (regotpCountdownTimer != null) { clearInterval(regotpCountdownTimer); regotpCountdownTimer = null; }
+        }
+
+        function startRegOtpCountdown(seconds) {
+            stopRegOtpCountdown();
+            regotpResendSeconds = seconds;
+            updateRegOtpResendUi();
+            if (regotpResendSeconds > 0) {
+                regotpCountdownTimer = setInterval(function () {
+                    regotpResendSeconds--;
+                    updateRegOtpResendUi();
+                    if (regotpResendSeconds <= 0) { stopRegOtpCountdown(); }
+                }, 1000);
+            }
+        }
+
+        function updateRegOtpResendUi() {
+            if (regotpResendSeconds > 0) {
+                QE('regotpResendButton', false);
+                QH('regotpResendTimer', 'Resend available in ' + regotpResendSeconds + 's');
+            } else {
+                QE('regotpResendButton', true);
+                QH('regotpResendTimer', '');
+            }
+        }
+
+        function resendRegOtp() {
+            if (regotpResendSeconds > 0) { return false; }
+            formSubmitted = false;
+            var f = document.createElement('form');
+            f.method = 'post';
+            f.style.display = 'none';
+            var a = document.createElement('input');
+            a.type = 'hidden';
+            a.name = 'action';
+            a.value = 'resendcreateotp';
+            f.appendChild(a);
+            var u = document.createElement('input');
+            u.type = 'hidden';
+            u.name = 'urlargs';
+            u.value = Q('createotpformargs').value;
+            f.appendChild(u);
+            document.body.appendChild(f);
+            f.submit();
+            return false;
         }
 
         function submitButtonClicked(v) {
