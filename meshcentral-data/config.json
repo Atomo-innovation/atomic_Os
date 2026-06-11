@@ -30,7 +30,7 @@
       "title": "Atomic Center",
       "autodevicegroup": true,
       "autodevicegroupname": "My Devices",
-      "nodeLoginUrl": "http://192.168.1.39:3000",
+      "nodeLoginUrl": "http://127.0.0.1:3000",
       "newaccounts": true,
       "minify": false,
       "sitestyle": 2,
