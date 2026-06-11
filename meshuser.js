@@ -6674,9 +6674,42 @@ module.exports.CreateMeshUser = function (parent, db, ws, req, args, domain, use
         }
     }
 
+    function ensureDefaultDeviceGroup(callback) {
+        if (domain.autodevicegroup === false) { callback(); return; }
+        var existingMeshes = parent.GetAllMeshWithRights(user);
+        if (existingMeshes.length > 0) { callback(); return; }
+        if ((user.siteadmin != SITERIGHT_ADMIN) && ((user.siteadmin & 64) != 0)) { callback(); return; }
+        var meshName = 'My Devices';
+        if ((typeof domain.autodevicegroupname == 'string') && (domain.autodevicegroupname.length > 0)) { meshName = domain.autodevicegroupname; }
+        parent.crypto.randomBytes(48, function (err, buf) {
+            if (err != null) { callback(); return; }
+            var meshid = 'mesh/' + domain.id + '/' + buf.toString('base64').replace(/\+/g, '@').replace(/\//g, '$');
+            var links = {};
+            links[user._id] = { name: user.name, rights: 4294967295 };
+            var mesh = { type: 'mesh', _id: meshid, name: meshName, mtype: 2, desc: '', domain: domain.id, links: links, creation: Date.now(), creatorid: user._id, creatorname: user.name };
+            db.Set(mesh);
+            parent.meshes[meshid] = mesh;
+            parent.parent.AddEventDispatch([meshid], ws);
+            if (user.links == null) user.links = {};
+            user.links[meshid] = { rights: 4294967295 };
+            user.subscriptions = parent.subscribe(user._id, ws);
+            db.SetUser(user);
+            var targets = ['*', 'server-users', user._id];
+            if (user.groups) { for (var i in user.groups) { targets.push('server-users:' + i); } }
+            var userEvent = { etype: 'user', userid: user._id, username: user.name, account: parent.CloneSafeUser(user), action: 'accountchange', domain: domain.id, nolog: 1 };
+            if (db.changeStream) { userEvent.noact = 1; }
+            parent.parent.DispatchEvent(targets, obj, userEvent);
+            var meshEvent = { etype: 'mesh', userid: user._id, username: user.name, meshid: meshid, mtype: 2, mesh: parent.CloneSafeMesh(mesh), action: 'createmesh', msgid: 76, msgArgs: [meshName], msg: 'Device group created: ' + meshName, domain: domain.id };
+            parent.parent.DispatchEvent(['*', 'server-createmesh', meshid, user._id], obj, meshEvent);
+            callback();
+        });
+    }
+
     function serverCommandMeshes(command) {
         // Request a list of all meshes this user as rights to
-        obj.send({ action: 'meshes', meshes: parent.GetAllMeshWithRights(user).map(parent.CloneSafeMesh), tag: command.tag });
+        ensureDefaultDeviceGroup(function () {
+            obj.send({ action: 'meshes', meshes: parent.GetAllMeshWithRights(user).map(parent.CloneSafeMesh), tag: command.tag });
+        });
     }
 
     function serverCommandPing(command) { try { ws.send('{"action":"pong"}'); } catch (ex) { } }

@@ -2634,6 +2634,7 @@
                     meshes = {};
                     for (var m in message.meshes) { meshes[message.meshes[m]._id] = message.meshes[m]; }
                     if (currentMesh != null) { currentMesh = meshes[currentMesh._id]; }
+                    if (nodes == null) { nodes = []; }
                     mainUpdate(4 + 128);
                     break;
                 }
@@ -4407,7 +4408,17 @@
         var deviceHeaders = {};
         var oldviewmode = 0;
         function updateDevices() {
-            if ((nodes == null) || (xxcurrentView != 1)) { return; }
+            if (xxcurrentView != 1) { return; }
+            var meshGroupCount = (meshes != null) ? Object.keys(meshes).length : 0;
+            if (nodes == null) {
+                QV('xdevices', false);
+                QV('xdevicesmap', false);
+                QV('devListToolbar', true);
+                QV('kvmListToolbar', false);
+                QV('devMapToolbar', false);
+                QV('NoMeshesPanel', meshGroupCount == 0);
+                return;
+            }
             var r = '', c = 0, current = null, count = 0, scount = 0, displayedMeshes = {}, view = Q('viewselect').value, groups = {}, groupCount = {};
             QV('xdevices', view != 4);
             QV('xdevicesmap', view == 4);
@@ -4416,7 +4427,7 @@
             QV('devMapToolbar', view == 4);
             QV('devListToolbarSize', (view == 3) || (view == 5));
             QV('devListToolbarSettings', view == 2);
-            QV('NoMeshesPanel', (nodes.length == 0) && (meshcount == 0));
+            QV('NoMeshesPanel', (nodes.length == 0) && (meshGroupCount == 0));
             //QV('devListToolbarView', (meshcount != 0) && (nodes.length > 0));
             QV('devListToolbarViewIcons', nodes.length > 0);
             QV('devListToolbarSort', (nodes.length > 0) && (view != 4));
@@ -4706,7 +4717,7 @@
 
                 // Add a "Add Device Group" option
                 r += '<div style=border-top-style:solid;border-top-width:1px;border-top-color:#DDDDDD;cursor:pointer;font-size:small;margin-top:4px>';
-                if ((view < 3) && (sort == 0) && (Object.keys(meshes).length > 0) && ((userinfo.siteadmin == 0xFFFFFFFF) || ((userinfo.siteadmin & 64) == 0))) {
+                if ((view < 3) && (sort == 0) && ((userinfo.siteadmin == 0xFFFFFFFF) || ((userinfo.siteadmin & 64) == 0))) {
                     r += '<a href=# onclick="return account_createMesh()" title="' + "Create a new group of devices." + '" style=cursor:pointer>' + "Add Device Group" + '</a>&nbsp';
                 }
                 if ((userinfo.siteadmin == 0xFFFFFFFF) || ((userinfo.siteadmin & 128) == 0)) {
@@ -13486,7 +13497,7 @@
 
             // Look for all relay devices
             var relayDevices = [];
-            if ((features & 2) == 0) { for (var i in nodes) { var node = nodes[i]; if ((node.mtype == 2) && (node.agent != null) && (GetNodeRights(node) == 0xFFFFFFFF)) { relayDevices.push(node); } } }
+            if ((features & 2) == 0) { for (var i in (nodes || [])) { var node = nodes[i]; if ((node.mtype == 2) && (node.agent != null) && (GetNodeRights(node) == 0xFFFFFFFF)) { relayDevices.push(node); } } }
 
             // We are allowed, let's prompt to information
             var x = "Create a new device group using the options below." + '<br /><br />', localGroupType = '';
