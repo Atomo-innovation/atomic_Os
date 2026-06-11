@@ -9,11 +9,11 @@
     "name": "Atomic Center"
   },
   "settings": {
-    "cert": "192.168.1.39",
+    "cert": "3.108.185.253",
     "port": 4434,
     "mpsPort": 4433,
     "redirPort": 1024,
-    "agentaliasdns": "192.168.1.39",
+    "agentaliasdns": "3.108.185.253",
     "autobackup": {
       "backuppath": "meshcentral-data/backups"
     },
